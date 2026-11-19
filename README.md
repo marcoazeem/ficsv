@@ -3,6 +3,14 @@
 A fast desktop CSV/TSV editor for very large files, written in Rust (egui). Runs on macOS and Windows (and Linux).
 Its feature set follows [Modern CSV](https://www.moderncsv.com/), including the Premium and Premium Business features.
 
+![FI CSV showing a 5,000-row orders file in the dark theme](docs/screenshots/main.png)
+
+| Command launcher (⌘⇧P / Ctrl+Shift+P) | File Analysis: unique values |
+|---|---|
+| ![Command launcher with fuzzy search](docs/screenshots/command-launcher.png) | ![Unique values with histogram](docs/screenshots/unique-values.png) |
+
+![Right-to-left Dhivehi, Arabic, Hebrew, Persian and Urdu next to CJK text, light theme](docs/screenshots/rtl-light.png)
+
 ## Why it's fast
 
 * The file is **memory-mapped**, never fully loaded. A background thread scans it once (quote-aware, using `memchr`)
