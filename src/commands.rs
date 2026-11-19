@@ -231,37 +231,106 @@ pub const MENUS: &[&str] = &[
     "File", "Edit", "Select", "Insert", "Remove", "Move", "Sort", "Filter", "Transform", "Headers", "Analysis", "View", "Web", "Help",
 ];
 
-/// Simple fuzzy match: all query chars appear in order. Returns a score (higher = better).
-pub fn fuzzy_score(query: &str, text: &str) -> Option<i32> {
-    if query.is_empty() {
-        return Some(0);
-    }
-    let t: Vec<char> = text.to_lowercase().chars().collect();
-    let mut score = 0;
-    let mut ti = 0;
-    let mut prev_match = false;
-    for qc in query.to_lowercase().chars() {
-        if qc == ' ' {
-            continue;
+/// Score how well one query word matches `text` (both lowercase). Tiers, best first:
+/// text starts with it > it starts a word > plain substring > letters in order (fuzzy).
+fn token_score(tok: &[char], text: &[char]) -> Option<i32> {
+    let n = tok.len();
+    let word_start = |i: usize| i == 0 || !text[i - 1].is_alphanumeric();
+    let mut best: Option<i32> = None;
+    if n <= text.len() {
+        for i in 0..=text.len() - n {
+            if text[i..i + n] == *tok {
+                let s = if i == 0 { 1000 } else if word_start(i) { 800 } else { 500 };
+                best = best.max(Some(s));
+                if s == 1000 {
+                    break;
+                }
+            }
         }
+    }
+    if best.is_some() {
+        return best;
+    }
+    // Fuzzy fallback: letters in order, rewarding runs and word starts. Capped below the
+    // substring tiers so a scattered match never outranks a real one.
+    let (mut score, mut ti, mut prev) = (0, 0, false);
+    for &qc in tok {
         let mut found = false;
-        while ti < t.len() {
-            let hit = t[ti] == qc;
+        while ti < text.len() {
+            let hit = text[ti] == qc;
             ti += 1;
             if hit {
-                score += if prev_match { 5 } else { 1 };
-                if ti == 1 || !t[ti - 2].is_alphanumeric() {
-                    score += 8;
-                }
+                score += if prev { 5 } else { 1 } + if word_start(ti - 1) { 8 } else { 0 };
                 found = true;
-                prev_match = true;
+                prev = true;
                 break;
             }
-            prev_match = false;
+            prev = false;
         }
         if !found {
             return None;
         }
     }
-    Some(score * 100 - t.len() as i32)
+    Some(score.min(450))
 }
+
+/// Fuzzy match for the launcher. Every whitespace-separated query word must match
+/// somewhere in `text`; higher = better, `None` = no match.
+pub fn fuzzy_score(query: &str, text: &str) -> Option<i32> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return Some(0);
+    }
+    let t: Vec<char> = text.to_lowercase().chars().collect();
+    let mut score = 0;
+    for word in q.split_whitespace() {
+        let w: Vec<char> = word.chars().collect();
+        score += token_score(&w, &t)? + 10 * w.len() as i32;
+    }
+    // The whole query appearing as typed (e.g. "select all") beats the words scattered.
+    if q.contains(' ') && text.to_lowercase().contains(&q) {
+        score += 400;
+    }
+    Some(score * 10 - t.len() as i32)
+}
+
+/// Launcher score for a command: matches in its name count more than matches that
+/// need the category ("Filter", "File" …) to succeed.
+pub fn command_score(query: &str, name: &str, category: &str) -> Option<i32> {
+    let in_name = fuzzy_score(query, name).map(|s| s + 3000);
+    let with_cat = fuzzy_score(query, &format!("{category} {name}"));
+    in_name.max(with_cat)
+}
+
+#[cfg(test)]
+mod launcher_tests {
+    use super::*;
+
+    fn rank(query: &str) -> Vec<&'static str> {
+        let mut v: Vec<(i32, &'static str)> =
+            ALL.iter().filter_map(|&c| command_score(query, c.name(), c.category()).map(|s| (s, c.name()))).collect();
+        v.sort_by(|a, b| b.0.cmp(&a.0));
+        v.into_iter().map(|(_, n)| n).collect()
+    }
+
+    #[test]
+    fn exact_words_beat_scattered_letters() {
+        let r = rank("filter");
+        let pos = |n: &str| r.iter().position(|x| *x == n).unwrap_or(usize::MAX);
+        assert!(pos("Add Filter…") < 3, "{:?}", &r[..5]);
+        assert!(pos("Toggle Read-Only") > pos("Hide Empty Row(s)"), "{:?}", &r[..12]);
+        let r = rank("unique");
+        assert_eq!(r[0], "Unique Values - Selected Column");
+        let r = rank("transpose");
+        assert!(r[0].starts_with("Transpose"), "{:?}", &r[..3]);
+    }
+
+    #[test]
+    fn fuzzy_still_works() {
+        assert!(fuzzy_score("adflt", "Add Filter...").is_some());
+        assert!(fuzzy_score("xyz", "Add Filter...").is_none());
+        assert!(fuzzy_score("sort desc", "Sort Selected Column - Descending").is_some());
+        assert_eq!(fuzzy_score("", "anything"), Some(0));
+    }
+}
+

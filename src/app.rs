@@ -2853,14 +2853,12 @@ impl App {
             }
         } else {
             for &c in commands::ALL {
-                let label = format!("{} {}", c.category(), c.name());
-                if let Some(sc) = commands::fuzzy_score(&p.query, &label) {
+                if let Some(sc) = commands::command_score(&p.query, c.name(), c.category()) {
                     items.push((sc, c.name().into(), c.category().into(), commands::shortcut_text(ctx, c), PalItem::Cmd(c)));
                 }
             }
             for (i, t) in self.transforms.iter().enumerate() {
-                let label = format!("Transform {}", t.name);
-                if let Some(sc) = commands::fuzzy_score(&p.query, &label) {
+                if let Some(sc) = commands::command_score(&p.query, t.name, "Transform") {
                     items.push((sc, t.name.into(), "Transform".into(), String::new(), PalItem::Transform(i)));
                 }
             }
