@@ -1,6 +1,6 @@
 [package]
 name = "ficsv"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 
 [dependencies]
@@ -25,3 +25,6 @@ uuid = { version = "1.29.3", features = ["v4", "v7"] }
 lto = "thin"
 codegen-units = 4
 strip = true
+
+[build-dependencies]
+winresource = "0.1.34"

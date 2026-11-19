@@ -24,7 +24,8 @@ fn main() -> eframe::Result {
             .with_title("ficsv")
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([520.0, 320.0])
-            .with_drag_and_drop(true),
+            .with_drag_and_drop(true)
+            .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon/icon-256.png")).unwrap_or_default()),
         ..Default::default()
     };
     eframe::run_native("ficsv", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, files)))))
