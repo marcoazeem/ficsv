@@ -218,3 +218,127 @@ fn autofit_fits_rtl_text() {
     }
     let _ = ctx.end_pass();
 }
+
+/// Drive the real grid widget headlessly with synthetic pointer events.
+fn grid_frame(ctx: &egui::Context, d: &mut Document, s: &crate::settings::Settings, t: f64, events: Vec<egui::Event>) {
+    let input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 700.0))),
+        time: Some(t),
+        events,
+        ..Default::default()
+    };
+    let _ = ctx.run_ui(input, |ui| {
+        egui::CentralPanel::no_frame().show(ui, |ui| {
+            crate::grid::show(ui, d, s, None);
+        });
+    });
+}
+
+fn press(pos: egui::Pos2, pressed: bool) -> egui::Event {
+    egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() }
+}
+
+#[test]
+fn double_click_border_autofits_rtl_column() {
+    let long = "ދިވެހިރާއްޖޭގެ ޖުމްހޫރިއްޔާ ".repeat(8);
+    let p = tmp("dbl.csv", format!("name,b\n{long},x\n").as_bytes());
+    let mut d = open(&p);
+    d.widths_measured = false; // let the grid size columns with real fonts
+    let s = crate::settings::Settings::default();
+    let ctx = egui::Context::default();
+    crate::rtl::install_fonts(&ctx, "");
+    let mut t = 0.0;
+    let mut frame = |d: &mut Document, ev: Vec<egui::Event>| {
+        t += 0.05;
+        grid_frame(&ctx, d, &s, t, ev);
+    };
+    frame(&mut d, vec![]);
+    frame(&mut d, vec![]);
+    let before = d.width_of(0);
+    // Border of column A: body starts after the row-label gutter.
+    let rn_w = 16.0 + 1.0 * (s.font_size * 0.6);
+    let border = egui::pos2(rn_w + before, 10.0);
+    frame(&mut d, vec![egui::Event::PointerMoved(border)]);
+    frame(&mut d, vec![press(border, true)]);
+    frame(&mut d, vec![press(border, false)]);
+    frame(&mut d, vec![press(border, true)]);
+    frame(&mut d, vec![press(border, false)]);
+    frame(&mut d, vec![]);
+    let after = d.width_of(0);
+    assert!(after > before + 50.0, "double-click should widen the column: before {before}, after {after}");
+
+    // Trackpad tap-to-click: both taps can arrive in the same frame.
+    let id = d.cols[0];
+    d.widths.insert(id, 120.0);
+    frame(&mut d, vec![]);
+    let border = egui::pos2(rn_w + 120.0, 10.0);
+    frame(&mut d, vec![egui::Event::PointerMoved(border)]);
+    frame(&mut d, vec![press(border, true), press(border, false), press(border, true), press(border, false)]);
+    frame(&mut d, vec![]);
+    assert!(d.width_of(0) > 400.0, "double-tap in one frame should auto-fit, got {}", d.width_of(0));
+}
+
+#[test]
+fn horizontal_swipe_does_not_move_rows() {
+    let body: String = (0..500).map(|i| format!("{i},{}\n", "x".repeat(40))).collect();
+    let p = tmp("swipe.csv", format!("a,b\n{body}").as_bytes());
+    let mut d = open(&p);
+    for c in 0..d.ncols() {
+        let id = d.cols[c];
+        d.widths.insert(id, 900.0);
+    }
+    let s = crate::settings::Settings::default();
+    let ctx = egui::Context::default();
+    let mid = egui::pos2(600.0, 300.0);
+    grid_frame(&ctx, &mut d, &s, 0.0, vec![egui::Event::PointerMoved(mid)]);
+    d.grid.top = 100;
+    d.grid.scroll_x = 400.0;
+    for k in 0..10 {
+        // Mostly-horizontal trackpad swipe to the left with a little vertical jitter.
+        let ev = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(30.0, 4.0), modifiers: Default::default(), phase: egui::TouchPhase::Move };
+        grid_frame(&ctx, &mut d, &s, 0.1 + k as f64 * 0.016, vec![ev]);
+    }
+    assert_eq!(d.grid.top, 100, "rows must not drift during a horizontal swipe");
+    assert!(d.grid.scroll_x < 400.0, "should have scrolled left");
+}
+
+#[test]
+fn menu_bar_switches_on_hover_when_open() {
+    let ctx = egui::Context::default();
+    let mut rects: Vec<egui::Rect> = Vec::new();
+    let mut ids: Vec<egui::Id> = Vec::new();
+    let mut frame = |t: f64, events: Vec<egui::Event>, rects: &mut Vec<egui::Rect>, ids: &mut Vec<egui::Id>| {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
+            time: Some(t),
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| {
+            let mut tops = Vec::new();
+            egui::MenuBar::new().ui(ui, |ui| {
+                for name in ["File", "Edit", "View"] {
+                    tops.push(ui.menu_button(name, |ui| { let _ = ui.button(format!("{name} item")); }).response);
+                }
+            });
+            crate::app::menu_hover_switch(ui.ctx(), &tops);
+            *rects = tops.iter().map(|r| r.rect).collect();
+            *ids = tops.iter().map(egui::Popup::default_response_id).collect();
+        });
+    };
+    frame(0.0, vec![], &mut rects, &mut ids);
+    let file = rects[0].center();
+    let edit = rects[1].center();
+    let view = rects[2].center();
+    frame(0.1, vec![egui::Event::PointerMoved(file), press(file, true)], &mut rects, &mut ids);
+    frame(0.2, vec![press(file, false)], &mut rects, &mut ids);
+    frame(0.3, vec![], &mut rects, &mut ids);
+    assert!(egui::Popup::is_id_open(&ctx, ids[0]), "File should open on click");
+    frame(0.4, vec![egui::Event::PointerMoved(edit)], &mut rects, &mut ids);
+    frame(0.5, vec![], &mut rects, &mut ids);
+    assert!(egui::Popup::is_id_open(&ctx, ids[1]), "hovering Edit should switch to Edit");
+    assert!(!egui::Popup::is_id_open(&ctx, ids[0]));
+    frame(0.6, vec![egui::Event::PointerMoved(view)], &mut rects, &mut ids);
+    frame(0.7, vec![], &mut rects, &mut ids);
+    assert!(egui::Popup::is_id_open(&ctx, ids[2]), "hovering View should switch to View");
+}

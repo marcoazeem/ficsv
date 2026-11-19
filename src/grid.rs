@@ -278,7 +278,14 @@ pub fn show(ui: &mut Ui, doc: &mut Document, s: &Settings, find_re: Option<&Rege
 
     // ---------- Mouse wheel ----------
     if resp.hovered() || resp.contains_pointer() {
-        let d = ui.input(|i| i.smooth_scroll_delta);
+        let mut d = ui.input(|i| i.smooth_scroll_delta);
+        // Lock each swipe to its dominant axis so sideways scrolling doesn't drift rows (and vice versa).
+        if d.x.abs() > d.y.abs() {
+            d.y = 0.0;
+            doc.grid.scroll_acc = 0.0;
+        } else {
+            d.x = 0.0;
+        }
         if d.y != 0.0 {
             doc.grid.scroll_acc -= d.y / row_h;
             let whole = doc.grid.scroll_acc.trunc();
@@ -320,6 +327,39 @@ pub fn show(ui: &mut Ui, doc: &mut Document, s: &Settings, find_re: Option<&Rege
         }
     }
 
+    // Double-click on a column border = auto-fit. Every press event in the frame is examined,
+    // so two trackpad taps delivered in a single frame still count as a double-click.
+    if resp.hovered() || resp.contains_pointer() {
+        let presses: Vec<egui::Pos2> = ui.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|e| match e {
+                    Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, .. } => Some(*pos),
+                    _ => None,
+                })
+                .collect()
+        });
+        let now = ui.input(|i| i.time);
+        for pp in presses {
+            if pp.y < grid.top() || pp.y >= top_strip {
+                doc.grid.last_border_press = None;
+                continue;
+            }
+            match border_at(pp.x, sx) {
+                Some(c) if doc.grid.last_border_press.is_some_and(|(t, lc)| lc == c && now - t < 0.5) => {
+                    let col = doc.vcols[c];
+                    if !doc.grid.autofit.contains(&col) {
+                        doc.grid.autofit.push(col);
+                    }
+                    doc.grid.last_border_press = None;
+                    ui.ctx().request_repaint();
+                }
+                Some(c) => doc.grid.last_border_press = Some((now, c)),
+                None => doc.grid.last_border_press = None,
+            }
+        }
+    }
+
     if pressed && resp.hovered() {
         if let Some(p) = pointer {
             if doc.grid.edit.is_some() && commit_edit(doc) {
@@ -333,15 +373,6 @@ pub fn show(ui: &mut Ui, doc: &mut Document, s: &Settings, find_re: Option<&Rege
             } else if p.y < top_strip {
                 if let Some(c) = border_at(p.x, sx) {
                     let id = doc.cols[doc.vcols[c]];
-                    // Second press on the same border within 0.45 s = double-click: auto-fit.
-                    let now = ui.input(|i| i.time);
-                    if doc.grid.last_border_press.is_some_and(|(t, lc)| lc == c && now - t < 0.45) {
-                        doc.grid.autofit.push(doc.vcols[c]);
-                        doc.grid.last_border_press = None;
-                        ui.ctx().request_repaint();
-                    } else {
-                        doc.grid.last_border_press = Some((now, c));
-                    }
                     // Remember the column's left edge in content coordinates.
                     doc.grid.drag = Drag::Resize(id, prefix[c]);
                 } else if p.x < body.left() {
@@ -387,9 +418,6 @@ pub fn show(ui: &mut Ui, doc: &mut Document, s: &Settings, find_re: Option<&Rege
                     if p.x > edge {
                         doc.grid.scroll_x += ((p.x - edge) * 0.6).clamp(6.0, 60.0);
                         ui.ctx().request_repaint();
-                    } else if p.x < body.left() + 12.0 && doc.grid.scroll_x > 0.0 {
-                        doc.grid.scroll_x = (doc.grid.scroll_x - 20.0).max(0.0);
-                        ui.ctx().request_repaint();
                     }
                     let content_x = p.x.min(body.right()) - body.left() + doc.grid.scroll_x;
                     doc.widths.insert(id, (content_x - left).max(MIN_COL_W));
@@ -433,7 +461,7 @@ pub fn show(ui: &mut Ui, doc: &mut Document, s: &Settings, find_re: Option<&Rege
         if let Some(p) = pointer {
             if p.y < top_strip {
                 if border_at(p.x, sx).is_some() {
-                    // Handled by the border double-press detection above.
+                    // Border double-clicks are handled by the press-event detection above.
                 } else if let Some(c) = col_at(p.x, sx) {
                     let on_header_row = doc.has_header && p.y >= grid.top() + label_h;
                     if on_header_row && label_h > 0.0 && !doc.read_only {

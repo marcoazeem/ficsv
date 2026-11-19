@@ -2011,9 +2011,10 @@ impl App {
     fn menu_bar(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
         let mut run = None;
+        let mut tops: Vec<egui::Response> = Vec::new();
         egui::MenuBar::new().ui(ui, |ui| {
             for &menu in commands::MENUS {
-                ui.menu_button(menu, |ui| {
+                let top = ui.menu_button(menu, |ui| {
                     if menu == "File" {
                         ui.menu_button("Open Recent", |ui| {
                             for r in self.settings.recent.clone() {
@@ -2041,8 +2042,10 @@ impl App {
                         }
                     }
                 });
+                tops.push(top.response);
             }
         });
+        menu_hover_switch(&ctx, &tops);
         if let Some(item) = run {
             self.run_item(&ctx, item);
         }
@@ -3084,6 +3087,21 @@ impl App {
             item(ui, c);
         }
         out
+    }
+}
+
+/// Like native menu bars: while one top-level menu is open, hovering another title switches to it.
+pub fn menu_hover_switch(ctx: &Context, tops: &[egui::Response]) {
+    let ids: Vec<egui::Id> = tops.iter().map(egui::Popup::default_response_id).collect();
+    if let Some(open) = ids.iter().position(|&id| egui::Popup::is_id_open(ctx, id)) {
+        let pointer = ctx.pointer_hover_pos();
+        if let Some(k) = tops.iter().position(|r| pointer.is_some_and(|p| r.rect.contains(p))) {
+            if k != open {
+                egui::Popup::close_id(ctx, ids[open]);
+                egui::Popup::open_id(ctx, ids[k]);
+                ctx.request_repaint();
+            }
+        }
     }
 }
 
