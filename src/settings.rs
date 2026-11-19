@@ -70,6 +70,7 @@ pub struct Settings {
     pub show_metadata: bool,
     pub show_editor_pane: bool,
     pub show_toolbar: bool,
+    pub check_updates: bool,
     pub folders: Vec<String>,
     /// Path to the Faruma font for Dhivehi (blank = auto-detect).
     pub dhivehi_font: String,
@@ -105,6 +106,7 @@ impl Default for Settings {
             show_metadata: false,
             show_editor_pane: false,
             show_toolbar: true,
+            check_updates: true,
             folders: Vec::new(),
             dhivehi_font: String::new(),
         }

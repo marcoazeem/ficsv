@@ -13,6 +13,7 @@ mod settings;
 mod table;
 mod transforms;
 mod ui_kit;
+mod updater;
 #[cfg(test)]
 mod tests;
 

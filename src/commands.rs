@@ -213,6 +213,7 @@ commands! {
     EmailAddresses => ("Email Selected Email Addresses", "Web", None),
 
     // ---- Help ----
+    CheckUpdates => ("Check for Updates…", "Help", None),
     About => ("About FI CSV", "Help", None),
 }
 

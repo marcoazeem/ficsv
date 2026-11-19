@@ -19,6 +19,7 @@ use crate::settings::{config_dir, ExternalChange, Settings, Theme};
 use crate::table::{col_letter, Param, ParamKind, ParamValues, TableRead};
 use crate::transforms;
 use crate::ui_kit;
+use crate::updater;
 
 const MAX_BLOCK: usize = 5_000_000;
 pub const APP_NAME: &str = "FI CSV";
@@ -82,6 +83,15 @@ enum PalItem {
     File(PathBuf),
 }
 
+/// In-app update flow (see updater.rs).
+enum Update {
+    Idle,
+    Checking { manual: bool, rx: std::sync::mpsc::Receiver<Result<Option<updater::Release>, String>> },
+    Available(updater::Release),
+    Downloading { rel: updater::Release, progress: Arc<std::sync::atomic::AtomicU64>, rx: std::sync::mpsc::Receiver<Result<PathBuf, String>> },
+    Ready { version: String, target: PathBuf },
+}
+
 struct Palette {
     query: String,
     sel: usize,
@@ -113,6 +123,7 @@ pub struct App {
     applied_theme: Option<(Theme, f32)>,
     logo: Option<egui::TextureHandle>,
     window_title: String,
+    update: Update,
     /// Paths still being saved before their tabs close (and whether to quit afterwards).
     close_after_save: Option<(HashSet<PathBuf>, bool)>,
 }
@@ -221,11 +232,15 @@ impl App {
             applied_theme: None,
             logo: None,
             window_title: String::new(),
+            update: Update::Idle,
             close_after_save: None,
         };
         app.rescan_folders();
         if let Some(w) = font_warning {
             app.msg(w);
+        }
+        if app.settings.check_updates {
+            app.check_updates(&cc.egui_ctx, false);
         }
         for f in files {
             app.open_path(&cc.egui_ctx, &f);
@@ -1462,6 +1477,7 @@ impl App {
 
             // ---------------- Web ----------------
             FollowLinks | WebSearch | EmailAddresses | MapSearch => self.web(cmd),
+            CheckUpdates => self.check_updates(ctx, true),
             About => self.dialog = Some(Dialog::About),
             _ => {}
         }
@@ -1998,6 +2014,164 @@ impl App {
         }
         self.applied_theme = Some(key);
         ui_kit::apply_style(ctx, self.settings.theme, self.settings.font_size);
+    }
+
+    fn check_updates(&mut self, ctx: &Context, manual: bool) {
+        if matches!(self.update, Update::Checking { .. } | Update::Downloading { .. }) {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx2 = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(updater::check());
+            ctx2.request_repaint();
+        });
+        self.update = Update::Checking { manual, rx };
+        if manual {
+            self.msg("Checking for updates…");
+        }
+    }
+
+    fn poll_update(&mut self) {
+        let mut message = None;
+        let next = match &self.update {
+            Update::Checking { manual, rx } => match rx.try_recv() {
+                Ok(Ok(Some(rel))) => Some(Update::Available(rel)),
+                Ok(Ok(None)) => {
+                    if *manual {
+                        message = Some(format!("You're up to date — {APP_NAME} {} is the latest version", updater::current_version()));
+                    }
+                    Some(Update::Idle)
+                }
+                Ok(Err(e)) => {
+                    if *manual {
+                        message = Some(format!("Couldn't check for updates: {e}"));
+                    }
+                    Some(Update::Idle)
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Update::Idle),
+                Err(_) => None,
+            },
+            Update::Downloading { rel, rx, .. } => match rx.try_recv() {
+                Ok(Ok(target)) => Some(Update::Ready { version: rel.version.clone(), target }),
+                Ok(Err(e)) => {
+                    message = Some(format!("Update failed: {e}"));
+                    Some(Update::Available(rel.clone()))
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Update::Available(rel.clone())),
+                Err(_) => None,
+            },
+            _ => None,
+        };
+        if let Some(n) = next {
+            self.update = n;
+        }
+        if let Some(m) = message {
+            self.msg(m);
+        }
+    }
+
+    /// Floating card announcing an update, with install progress.
+    fn update_card(&mut self, ctx: &Context) {
+        use ui_kit::icon;
+        if matches!(self.update, Update::Idle | Update::Checking { .. }) {
+            return;
+        }
+        let v = ctx.global_style().visuals.clone();
+        let accent = v.selection.stroke.color;
+        let weak = v.weak_text_color();
+        let mut action = 0u8; // 1 install, 2 later, 3 restart
+        egui::Area::new(egui::Id::new("update-card"))
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 104.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(v.window_fill)
+                    .stroke(v.window_stroke)
+                    .shadow(v.popup_shadow)
+                    .corner_radius(12)
+                    .inner_margin(egui::Margin::same(14))
+                    .show(ui, |ui| {
+                        ui.set_width(300.0);
+                        ui.horizontal(|ui| {
+                            ui.label(ui_kit::icon_text(icon::SPARKLE, 20.0).color(accent));
+                            ui.vertical(|ui| match &self.update {
+                                Update::Available(rel) => {
+                                    ui.label(RichText::new(format!("{APP_NAME} {} is available", rel.version)).font(ui_kit::semibold(14.0)));
+                                    ui.label(RichText::new(format!("You have {}", updater::current_version())).size(12.0).color(weak));
+                                    if !rel.notes_url.is_empty() {
+                                        ui.hyperlink_to(RichText::new("What's new").size(12.0), &rel.notes_url);
+                                    }
+                                }
+                                Update::Downloading { rel, progress, .. } => {
+                                    ui.label(RichText::new(format!("Downloading {APP_NAME} {}…", rel.version)).font(ui_kit::semibold(14.0)));
+                                    let got = progress.load(std::sync::atomic::Ordering::Relaxed) as f32;
+                                    let frac = if rel.asset_size > 0 { got / rel.asset_size as f32 } else { 0.0 };
+                                    ui.add(egui::ProgressBar::new(frac.min(1.0)).desired_width(220.0).text(format!("{:.1} / {:.1} MB", got / 1e6, rel.asset_size as f32 / 1e6)));
+                                    ui.ctx().request_repaint_after(Duration::from_millis(100));
+                                }
+                                Update::Ready { version, .. } => {
+                                    ui.label(RichText::new(format!("{APP_NAME} {version} is installed")).font(ui_kit::semibold(14.0)));
+                                    ui.label(RichText::new("Restart to start using it.").size(12.0).color(weak));
+                                }
+                                _ => {}
+                            });
+                        });
+                        ui.add_space(8.0);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| match &self.update {
+                            Update::Available(_) => {
+                                if ui_kit::primary(ui, "Install & Restart").clicked() {
+                                    action = 1;
+                                }
+                                if ui_kit::secondary(ui, "Later").clicked() {
+                                    action = 2;
+                                }
+                            }
+                            Update::Ready { .. } => {
+                                if ui_kit::primary(ui, "Restart Now").clicked() {
+                                    action = 3;
+                                }
+                                if ui_kit::secondary(ui, "Later").clicked() {
+                                    action = 2;
+                                }
+                            }
+                            _ => {}
+                        });
+                    });
+            });
+        match action {
+            1 => {
+                if let Update::Available(rel) = &self.update {
+                    let rel = rel.clone();
+                    let progress = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let (p2, r2, ctx2) = (progress.clone(), rel.clone(), ctx.clone());
+                    std::thread::spawn(move || {
+                        let _ = tx.send(updater::install(&r2, &p2));
+                        ctx2.request_repaint();
+                    });
+                    self.update = Update::Downloading { rel, progress, rx };
+                }
+            }
+            2 => {
+                // "Later": hide until the next launch (a Ready update installs on next start anyway).
+                self.update = Update::Idle;
+            }
+            3 => {
+                if self.docs.iter().any(|d| d.dirty) {
+                    self.msg("Save or close your unsaved files first, then restart");
+                } else if let Update::Ready { target, .. } = &self.update {
+                    match updater::relaunch(target) {
+                        Ok(()) => {
+                            self.allow_quit = true;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        Err(e) => self.msg(format!("Couldn't restart: {e}")),
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     fn logo(&mut self, ctx: &Context) -> egui::TextureHandle {
@@ -3383,6 +3557,7 @@ impl App {
                                 ui.checkbox(&mut s.save_after_each_edit, "Save after each edit");
                                 ui.end_row();
                                 ui.checkbox(&mut s.show_toolbar, "Show toolbar");
+                                ui.checkbox(&mut s.check_updates, "Check for updates on launch");
                                 ui.end_row();
                             });
                             egui::Grid::new("prefs-f2").num_columns(2).spacing([16.0, 8.0]).min_col_width(170.0).show(ui, |ui| {
@@ -3702,6 +3877,8 @@ impl eframe::App for App {
                 }
             }
         }
+        self.poll_update();
+        self.update_card(&ctx);
         self.palette_ui(&ctx);
         self.prompt_ui(&ctx);
         self.dialogs(&ctx);

@@ -71,7 +71,15 @@ cargo test --release perf_big_file -- --ignored --nocapture   # 5M-row benchmark
 * On macOS, "Open With…" from Finder isn't wired up yet (drag & drop, the Open dialog and the command line all work).
 * Keyboard shortcuts are fixed (not yet user-customisable).
 
-## Download
+## Updates
+
+FI CSV checks GitHub for a newer release when it starts (turn this off in Preferences, or use **Help ▸ Check for Updates…**).
+When one is available it shows **Install & Restart**: it downloads the zip for that machine from the latest
+[GitHub Release](../../releases), replaces the app in place and relaunches. To ship an update, bump `version` in
+`Cargo.toml`, commit, and push a tag like `v0.2.2` — CI builds the release and every installed copy picks it up.
+(Versions before 0.2.1 don't include the updater, so those users need to download once manually.)
+
+## Download (manual)
 
 Prebuilt macOS (Apple Silicon / Intel) and Windows builds are attached to each [GitHub Release](../../releases).
 They are not notarized: on macOS right-click **FI CSV.app** → **Open** the first time; on Windows choose **More info → Run anyway** if SmartScreen warns.

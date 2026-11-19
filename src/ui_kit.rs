@@ -49,6 +49,8 @@ pub mod icon {
     pub const PRINTER: &str = "\u{E3DC}";
     pub const DOTS: &str = "\u{E1FE}";
     pub const WORD: &str = "\u{E5BE}";
+    pub const DOWNLOAD: &str = "\u{E20C}";
+    pub const SPARKLE: &str = "\u{E6A2}";
 }
 
 /// Brand orange (from the app icon).
