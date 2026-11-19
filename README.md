@@ -70,3 +70,8 @@ cargo test --release perf_big_file -- --ignored --nocapture   # 5M-row benchmark
 * Text being edited in an input box (cell editor, editor pane) uses egui's left-to-right caret. RTL text is displayed correctly in the grid, but the caret moves in logical order while you edit.
 * On macOS, "Open With…" from Finder isn't wired up yet (drag & drop, the Open dialog and the command line all work).
 * Keyboard shortcuts are fixed (not yet user-customisable).
+
+## Download
+
+Prebuilt macOS (Apple Silicon / Intel) and Windows builds are attached to each [GitHub Release](../../releases).
+They are not notarized: on macOS right-click `ficsv.app` → **Open** the first time; on Windows choose **More info → Run anyway** if SmartScreen warns.

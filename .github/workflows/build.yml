@@ -40,10 +40,39 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target/${{ matrix.target }}/release/ficsv.exe dist/
+          Compress-Archive -Path dist/ficsv.exe -DestinationPath ${{ matrix.artifact }}.zip
       - name: Package (macOS)
         if: runner.os == 'macOS'
-        run: ./scripts/bundle-macos.sh target/${{ matrix.target }}/release/ficsv dist
+        run: |
+          ./scripts/bundle-macos.sh target/${{ matrix.target }}/release/ficsv dist
+          codesign --force --deep --sign - dist/ficsv.app
+          ditto -c -k --keepParent dist/ficsv.app ${{ matrix.artifact }}.zip
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: dist/
+          path: ${{ matrix.artifact }}.zip
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.zip
+          generate_release_notes: true
+          body: |
+            ## Downloads
+            - **macOS (Apple Silicon)**: `ficsv-macos-arm64.zip`
+            - **macOS (Intel)**: `ficsv-macos-x64.zip`
+            - **Windows (64-bit)**: `ficsv-windows-x64.zip`
+
+            The builds are not notarized / code-signed with a paid certificate:
+            - macOS: unzip, then right-click `ficsv.app` → **Open** the first time (or run `xattr -dr com.apple.quarantine ficsv.app`).
+            - Windows: SmartScreen may warn — click **More info → Run anyway**.
