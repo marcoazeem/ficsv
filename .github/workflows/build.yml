@@ -1,0 +1,49 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: ficsv-windows-x64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: ficsv-macos-arm64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: ficsv-macos-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        if: matrix.target != 'x86_64-apple-darwin'
+        run: cargo test --release
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/${{ matrix.target }}/release/ficsv.exe dist/
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: ./scripts/bundle-macos.sh target/${{ matrix.target }}/release/ficsv dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/

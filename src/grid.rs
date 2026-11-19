@@ -1,36 +1,36 @@
-//! Custom virtualised table. Scrolling is tracked as a row index (not pixels)
+//! Custom virtualised table. Vertical scrolling is tracked as a row index (not pixels)
 //! so files with hundreds of millions of rows scroll precisely.
 
 use egui::{
-    pos2, vec2, Align2, Color32, CursorIcon, Event, EventFilter, FontId, Key, Rect, Sense, Stroke,
+    pos2, vec2, Align2, Color32, CursorIcon, Event, EventFilter, FontId, Id, Key, Rect, Response, Sense, Stroke,
     StrokeKind, TextEdit, Ui,
 };
+use regex::Regex;
 
 use crate::doc::{CellEdit, Document, Drag};
-use crate::query::contains_ci;
+use crate::rtl;
+use crate::settings::Settings;
+use crate::table::col_letter;
 
-pub const ROW_H: f32 = 22.0;
-const HEAD_H: f32 = 24.0;
+const LABEL_H: f32 = 20.0;
 const SB: f32 = 12.0;
-const MIN_COL_W: f32 = 28.0;
-const MAX_COPY_CELLS: usize = 2_000_000;
+const MIN_COL_W: f32 = 24.0;
+pub const MAX_COPY_CELLS: usize = 5_000_000;
+pub const HEADER_ROW: usize = usize::MAX;
+
+pub fn grid_id() -> Id {
+    Id::new("ficsv-grid")
+}
 
 pub enum GridEvent {
     Sort(usize),
     Message(String),
+    Edited,
 }
 
-pub fn col_letter(mut c: usize) -> String {
-    let mut s = Vec::new();
-    loop {
-        s.push(b'A' + (c % 26) as u8);
-        if c < 26 {
-            break;
-        }
-        c = c / 26 - 1;
-    }
-    s.reverse();
-    String::from_utf8(s).unwrap()
+pub struct GridOut {
+    pub event: Option<GridEvent>,
+    pub response: Response,
 }
 
 fn display_text(s: &str) -> String {
@@ -54,155 +54,221 @@ fn looks_numeric(s: &str) -> bool {
     !t.is_empty() && t.len() < 32 && t.parse::<f64>().is_ok()
 }
 
-fn sel_range(doc: &Document) -> ((usize, usize), (usize, usize)) {
-    let (a, b) = (doc.grid.anchor, doc.grid.cur);
-    ((a.0.min(b.0), a.1.min(b.1)), (a.0.max(b.0), a.1.max(b.1)))
+fn tsv_escape(v: &str, out: &mut String) {
+    if v.contains(['\t', '\n', '"']) {
+        out.push('"');
+        out.push_str(&v.replace('"', "\"\""));
+        out.push('"');
+    } else {
+        out.push_str(v);
+    }
 }
 
-fn copy_selection(ui: &Ui, doc: &Document) -> Option<String> {
-    let nrows = doc.view_len();
-    if nrows == 0 {
-        return None;
+/// Copy the selection as TSV. Returns an error message if it is too large.
+pub fn copy_selection(ctx: &egui::Context, doc: &Document, with_header: bool) -> Result<(), String> {
+    let nrows = doc.vrows();
+    if nrows == 0 || doc.vcols.is_empty() {
+        return Ok(());
     }
-    let ((r0, c0), (r1, c1)) = sel_range(doc);
+    let ((r0, c0), (r1, c1)) = doc.sel_range();
     let r1 = r1.min(nrows - 1);
+    let c1 = c1.min(doc.vcols.len() - 1);
     let cells = (r1 + 1 - r0) * (c1 + 1 - c0);
     if cells > MAX_COPY_CELLS {
-        return Some(format!("Selection too large to copy ({cells} cells)"));
+        return Err(format!("Selection too large to copy ({cells} cells)"));
     }
+    let snap = doc.snap();
+    let cols: Vec<usize> = (c0..=c1).map(|vc| doc.vcols[vc]).collect();
     let mut out = String::new();
-    for r in r0..=r1 {
-        let f = doc.row_fields(doc.rec_of(r));
-        for c in c0..=c1 {
-            if c > c0 {
+    if with_header && doc.has_header {
+        let h = snap.header_names();
+        for (i, &c) in cols.iter().enumerate() {
+            if i > 0 {
                 out.push('\t');
             }
-            let v = f.get(c).map(String::as_str).unwrap_or("");
-            if v.contains(['\t', '\n', '"']) {
-                out.push('"');
-                out.push_str(&v.replace('"', "\"\""));
-                out.push('"');
-            } else {
-                out.push_str(v);
-            }
+            tsv_escape(h.get(c).map(String::as_str).unwrap_or(""), &mut out);
         }
         out.push('\n');
     }
-    ui.ctx().copy_text(out);
-    None
+    for vr in r0..=r1 {
+        let vals = snap.row_values(doc.data_row_id(doc.vrow_to_data(vr)));
+        for (i, &c) in cols.iter().enumerate() {
+            if i > 0 {
+                out.push('\t');
+            }
+            tsv_escape(vals.get(c).map(String::as_str).unwrap_or(""), &mut out);
+        }
+        out.push('\n');
+    }
+    ctx.copy_text(out);
+    Ok(())
 }
 
-fn paste(doc: &mut Document, text: &str) {
-    let nrows = doc.view_len();
-    if nrows == 0 {
+/// Parse clipboard text (TSV with optional quotes, or CSV if no tabs).
+pub fn parse_clipboard(text: &str) -> Vec<Vec<String>> {
+    let text = text.trim_end_matches(['\n', '\r']);
+    let delim = if text.contains('\t') { b'\t' } else if text.lines().count() > 1 && text.contains(',') { b',' } else { b'\t' };
+    let mut rows = Vec::new();
+    // Re-use the CSV field parser on each logical line, respecting quoted newlines.
+    let bytes = text.as_bytes();
+    let mut start = 0;
+    let mut in_q = false;
+    for i in 0..=bytes.len() {
+        let end = i == bytes.len();
+        if !end && bytes[i] == b'"' {
+            in_q = !in_q;
+        }
+        if end || (bytes[i] == b'\n' && !in_q) {
+            let mut line = &bytes[start..i];
+            if line.last() == Some(&b'\r') {
+                line = &line[..line.len() - 1];
+            }
+            rows.push(crate::doc::Fields::new(line, delim, true).map(|f| String::from_utf8_lossy(&f).into_owned()).collect());
+            start = i + 1;
+        }
+    }
+    rows
+}
+
+pub fn paste(doc: &mut Document, text: &str) {
+    if doc.vrows() == 0 || doc.vcols.is_empty() {
         return;
     }
-    let (r0, c0) = sel_range(doc).0;
-    let lines: Vec<&str> = text.trim_end_matches(['\n', '\r']).split('\n').collect();
+    let ((r0, c0), (r1, c1)) = doc.sel_range();
+    let block = parse_clipboard(text);
+    if block.is_empty() {
+        return;
+    }
+    let single = block.len() == 1 && block[0].len() == 1;
     let mut items = Vec::new();
+    let mut max_r = r0;
     let mut max_c = c0;
-    for (i, line) in lines.iter().enumerate() {
-        let r = r0 + i;
-        if r >= nrows {
-            break;
+    if single && (r0, c0) != (r1, c1) {
+        // One value pasted into a multi-cell selection fills it.
+        for vr in r0..=r1.min(doc.vrows() - 1) {
+            for vc in c0..=c1.min(doc.vcols.len() - 1) {
+                items.push((doc.vrow_to_data(vr), doc.vcols[vc], block[0][0].clone()));
+            }
         }
-        let rec = doc.rec_of(r);
-        for (j, v) in line.trim_end_matches('\r').split('\t').enumerate() {
-            items.push((rec, c0 + j, v.to_string()));
-            max_c = max_c.max(c0 + j);
+        max_r = r1;
+        max_c = c1;
+    } else {
+        // Grow the table to the right if needed.
+        let need_cols = c0 + block.iter().map(|r| r.len()).max().unwrap_or(0);
+        if need_cols > doc.vcols.len() && doc.ready() {
+            let extra = need_cols - doc.vcols.len();
+            doc.insert_cols(doc.ncols(), extra);
+        }
+        for (i, row) in block.iter().enumerate() {
+            let vr = r0 + i;
+            if vr >= doc.vrows() {
+                break;
+            }
+            for (j, v) in row.iter().enumerate() {
+                let vc = c0 + j;
+                if vc >= doc.vcols.len() {
+                    break;
+                }
+                items.push((doc.vrow_to_data(vr), doc.vcols[vc], v.clone()));
+                max_r = max_r.max(vr);
+                max_c = max_c.max(vc);
+            }
         }
     }
-    let last_r = (r0 + lines.len()).min(nrows) - 1;
     doc.set_cells(items);
     doc.grid.anchor = (r0, c0);
-    doc.grid.cur = (last_r, max_c);
+    doc.grid.cur = (max_r, max_c);
 }
 
-fn clear_selection(doc: &mut Document) {
-    let nrows = doc.view_len();
-    if nrows == 0 {
+pub fn clear_selection(doc: &mut Document) {
+    let n = doc.vrows();
+    if n == 0 || doc.vcols.is_empty() {
         return;
     }
-    let ((r0, c0), (r1, c1)) = sel_range(doc);
-    let r1 = r1.min(nrows - 1);
+    let ((r0, c0), (r1, c1)) = doc.sel_range();
+    let r1 = r1.min(n - 1);
+    let c1 = c1.min(doc.vcols.len() - 1);
     if (r1 + 1 - r0) * (c1 + 1 - c0) > MAX_COPY_CELLS {
         return;
     }
     let mut items = Vec::new();
-    for r in r0..=r1 {
-        let rec = doc.rec_of(r);
-        for c in c0..=c1 {
-            items.push((rec, c, String::new()));
+    for vr in r0..=r1 {
+        let d = doc.vrow_to_data(vr);
+        for vc in c0..=c1 {
+            items.push((d, doc.vcols[vc], String::new()));
         }
     }
     doc.set_cells(items);
 }
 
-fn start_edit(doc: &mut Document, text: Option<String>) {
-    if doc.view_len() == 0 {
+pub fn start_edit(doc: &mut Document, text: Option<String>) {
+    if doc.read_only || doc.vrows() == 0 || doc.vcols.is_empty() {
         return;
     }
     let (row, col) = doc.grid.cur;
-    let text = text.unwrap_or_else(|| doc.cell(doc.rec_of(row), col));
+    let text = text.unwrap_or_else(|| doc.cell(doc.vrow_to_data(row), doc.vcols[col]));
     doc.grid.anchor = doc.grid.cur;
     doc.grid.edit = Some(CellEdit { row, col, text, needs_focus: true });
 }
 
-fn commit_edit(doc: &mut Document) {
+fn commit_edit(doc: &mut Document) -> bool {
     if let Some(e) = doc.grid.edit.take() {
-        if e.row < doc.view_len() {
-            let rec = doc.rec_of(e.row);
-            doc.set_cells(vec![(rec, e.col, e.text)]);
+        let Some(&c) = doc.vcols.get(e.col) else { return false };
+        if e.row == HEADER_ROW {
+            doc.set_cells_t(vec![(0, c, e.text)]);
+            return true;
+        }
+        if e.row < doc.vrows() {
+            let d = doc.vrow_to_data(e.row);
+            doc.set_cells(vec![(d, c, e.text)]);
+            return true;
         }
     }
+    false
 }
 
-fn jump_to_change(doc: &mut Document, at: Option<(u32, u32)>) {
-    if let Some((rec, col)) = at {
-        if let Some(row) = doc.row_of_rec(rec as usize) {
-            doc.grid.cur = (row, col as usize);
-            doc.grid.anchor = doc.grid.cur;
-            doc.ensure_visible();
-        }
-    }
-}
-
-pub fn show(ui: &mut Ui, doc: &mut Document, find_lc: &str) -> Option<GridEvent> {
+pub fn show(ui: &mut Ui, doc: &mut Document, s: &Settings, find_re: Option<&Regex>) -> GridOut {
     let mut event = None;
-    doc.measure_if_needed();
+    let row_h = s.row_height.max(s.font_size + 6.0);
+    doc.measure_if_needed(s.char_width(), s.max_autofit_width);
 
     let rect = ui.available_rect_before_wrap();
-    let resp = ui.allocate_rect(rect, Sense::click_and_drag());
+    let resp = ui.interact(rect, grid_id(), Sense::click_and_drag());
+    ui.allocate_rect(rect, Sense::hover());
     let painter = ui.painter_at(rect);
     let vis = ui.visuals().clone();
 
-    let nrows = doc.view_len();
-    let digits = ((doc.record_count().max(1)) as f64).log10().floor() as usize + 1;
-    let rn_w = 18.0 + digits as f32 * 7.5;
+    let nrows = doc.vrows();
+    let ncols_v = doc.vcols.len();
+    let digits = ((doc.nrows().max(1) as f64 + s.first_row_index.max(0) as f64).log10().floor() as usize) + 1;
+    let rn_w = if s.show_row_labels { 16.0 + digits as f32 * (s.font_size * 0.6) } else { 0.0 };
+    let label_h = if s.show_col_labels || !doc.has_header { LABEL_H } else { 0.0 };
+    let head_h = if doc.has_header { row_h + 2.0 } else { 0.0 };
 
     let grid = Rect::from_min_max(rect.min, pos2(rect.right() - SB, rect.bottom() - SB));
-    let body = Rect::from_min_max(pos2(grid.left() + rn_w, grid.top() + HEAD_H), grid.max);
+    let body = Rect::from_min_max(pos2(grid.left() + rn_w, grid.top() + label_h + head_h), grid.max);
     let vs_rect = Rect::from_min_max(pos2(grid.right(), rect.top()), pos2(rect.right(), grid.bottom()));
     let hs_rect = Rect::from_min_max(pos2(rect.left(), grid.bottom()), pos2(grid.right(), rect.bottom()));
 
-    let vis_rows = ((body.height() / ROW_H).floor() as usize).max(1);
+    let vis_rows = ((body.height() / row_h).floor() as usize).max(1);
     doc.grid.vis_rows = vis_rows;
     doc.grid.body_w = body.width();
     let max_top = nrows.saturating_sub(vis_rows);
 
-    let mut prefix = Vec::with_capacity(doc.ncols + 1);
+    let widths = doc.col_widths_visible();
+    let mut prefix = Vec::with_capacity(widths.len() + 1);
     prefix.push(0.0f32);
-    for w in &doc.col_widths {
+    for w in &widths {
         prefix.push(prefix.last().unwrap() + w);
     }
     let total_w = *prefix.last().unwrap();
     let max_sx = (total_w - body.width() + 40.0).max(0.0);
 
     // ---------- Mouse wheel ----------
-    if resp.hovered() {
+    if resp.hovered() || resp.contains_pointer() {
         let d = ui.input(|i| i.smooth_scroll_delta);
         if d.y != 0.0 {
-            doc.grid.scroll_acc -= d.y / ROW_H;
+            doc.grid.scroll_acc -= d.y / row_h;
             let whole = doc.grid.scroll_acc.trunc();
             doc.grid.scroll_acc -= whole;
             let top = doc.grid.top as i64 + whole as i64;
@@ -221,59 +287,64 @@ pub fn show(ui: &mut Ui, doc: &mut Document, find_lc: &str) -> Option<GridEvent>
             return None;
         }
         let i = prefix.partition_point(|&p| p <= x);
-        (i >= 1 && i - 1 < doc_ncols(&prefix)).then(|| i - 1)
+        (i >= 1 && i - 1 < ncols_v).then(|| i - 1)
     };
-    fn doc_ncols(prefix: &[f32]) -> usize {
-        prefix.len() - 1
-    }
+    let border_at = |x: f32, sx: f32| -> Option<usize> {
+        if x <= body.left() {
+            return None;
+        }
+        (0..ncols_v).find(|&c| (body.left() + prefix[c + 1] - sx - x).abs() < 4.0)
+    };
 
     // ---------- Pointer ----------
-    let (pointer, pressed, down, mods) = ui.input(|i| {
-        (i.pointer.interact_pos(), i.pointer.primary_pressed(), i.pointer.primary_down(), i.modifiers)
-    });
+    let (pointer, pressed, down, mods) =
+        ui.input(|i| (i.pointer.interact_pos(), i.pointer.primary_pressed(), i.pointer.primary_down(), i.modifiers));
     let sx = doc.grid.scroll_x;
+    let top_strip = grid.top() + label_h + head_h;
 
-    // Hover cursor for resize handles.
     if let Some(p) = pointer.filter(|_| resp.hovered()) {
-        if p.y >= grid.top() && p.y < grid.top() + HEAD_H && p.x > body.left() {
-            if (0..doc.ncols).any(|c| (body.left() + prefix[c + 1] - sx - p.x).abs() < 4.0) {
-                ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
-            }
+        if p.y >= grid.top() && p.y < top_strip && border_at(p.x, sx).is_some() {
+            ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
         }
     }
 
     if pressed && resp.hovered() {
         if let Some(p) = pointer {
-            if doc.grid.edit.is_some() {
-                commit_edit(doc);
+            if doc.grid.edit.is_some() && commit_edit(doc) {
+                event = Some(GridEvent::Edited);
             }
             resp.request_focus();
             if vs_rect.contains(p) {
                 doc.grid.drag = Drag::VScroll;
             } else if hs_rect.contains(p) {
                 doc.grid.drag = Drag::HScroll;
-            } else if p.y < grid.top() + HEAD_H {
-                // Header row
-                let resize = (0..doc.ncols).find(|&c| (body.left() + prefix[c + 1] - sx - p.x).abs() < 4.0);
-                if let Some(c) = resize.filter(|_| p.x > body.left()) {
-                    doc.grid.drag = Drag::Resize(c, p.x - doc.col_widths[c]);
+            } else if p.y < top_strip {
+                if let Some(c) = border_at(p.x, sx) {
+                    let id = doc.cols[doc.vcols[c]];
+                    doc.grid.drag = Drag::Resize(id, p.x - widths[c]);
                 } else if p.x < body.left() {
-                    // Corner: select all
                     doc.grid.anchor = (0, 0);
-                    doc.grid.cur = (nrows.saturating_sub(1), doc.ncols - 1);
+                    doc.grid.cur = (nrows.saturating_sub(1), ncols_v.saturating_sub(1));
                 } else if let Some(c) = col_at(p.x, sx) {
-                    // Select whole column (cursor stays on screen).
-                    doc.grid.anchor = (nrows.saturating_sub(1), c);
-                    doc.grid.cur = (doc.grid.top.min(nrows.saturating_sub(1)), c);
+                    if mods.shift {
+                        doc.grid.cur.1 = c;
+                    } else {
+                        doc.grid.anchor = (nrows.saturating_sub(1), c);
+                        doc.grid.cur = (doc.grid.top.min(nrows.saturating_sub(1)), c);
+                    }
                 }
             } else if p.x < body.left() {
-                let r = doc.grid.top + ((p.y - body.top()) / ROW_H) as usize;
+                let r = doc.grid.top + ((p.y - body.top()) / row_h) as usize;
                 if r < nrows {
-                    doc.grid.anchor = (r, doc.ncols - 1);
-                    doc.grid.cur = (r, 0);
+                    if mods.shift {
+                        doc.grid.cur.0 = r;
+                    } else {
+                        doc.grid.anchor = (r, ncols_v.saturating_sub(1));
+                        doc.grid.cur = (r, 0);
+                    }
                 }
             } else {
-                let r = doc.grid.top + ((p.y - body.top()) / ROW_H) as usize;
+                let r = doc.grid.top + ((p.y - body.top()) / row_h) as usize;
                 if let (true, Some(c)) = (r < nrows, col_at(p.x, sx)) {
                     doc.grid.cur = (r, c);
                     if !mods.shift {
@@ -288,7 +359,9 @@ pub fn show(ui: &mut Ui, doc: &mut Document, find_lc: &str) -> Option<GridEvent>
     if down {
         if let Some(p) = pointer {
             match doc.grid.drag {
-                Drag::Resize(c, base) => doc.col_widths[c] = (p.x - base).max(MIN_COL_W),
+                Drag::Resize(id, base) => {
+                    doc.widths.insert(id, (p.x - base).max(MIN_COL_W));
+                }
                 Drag::VScroll => {
                     let thumb_h = (vs_rect.height() * vis_rows as f32 / nrows.max(1) as f32).clamp(24.0, vs_rect.height());
                     let t = ((p.y - vs_rect.top() - thumb_h / 2.0) / (vs_rect.height() - thumb_h).max(1.0)).clamp(0.0, 1.0);
@@ -300,16 +373,20 @@ pub fn show(ui: &mut Ui, doc: &mut Document, find_lc: &str) -> Option<GridEvent>
                     doc.grid.scroll_x = t * max_sx;
                 }
                 Drag::Select => {
-                    // Auto-scroll when dragging past the edges.
                     if p.y > body.bottom() && doc.grid.top < max_top {
                         doc.grid.top += 1;
                     } else if p.y < body.top() && doc.grid.top > 0 {
                         doc.grid.top -= 1;
                     }
-                    let r = (doc.grid.top as i64 + ((p.y - body.top()) / ROW_H).floor() as i64)
+                    if p.x > body.right() {
+                        doc.grid.scroll_x = (doc.grid.scroll_x + 20.0).min(max_sx);
+                    } else if p.x < body.left() {
+                        doc.grid.scroll_x = (doc.grid.scroll_x - 20.0).max(0.0);
+                    }
+                    let r = (doc.grid.top as i64 + ((p.y - body.top()) / row_h).floor() as i64)
                         .clamp(0, nrows.saturating_sub(1) as i64) as usize;
                     let c = col_at(p.x.clamp(body.left(), body.right() - 1.0), doc.grid.scroll_x)
-                        .unwrap_or(doc.ncols - 1);
+                        .unwrap_or(ncols_v.saturating_sub(1));
                     doc.grid.cur = (r, c);
                     ui.ctx().request_repaint();
                 }
@@ -322,11 +399,16 @@ pub fn show(ui: &mut Ui, doc: &mut Document, find_lc: &str) -> Option<GridEvent>
 
     if resp.double_clicked() {
         if let Some(p) = pointer {
-            if p.y < grid.top() + HEAD_H && p.x > body.left() {
-                let on_border = (0..doc.ncols).any(|c| (body.left() + prefix[c + 1] - sx - p.x).abs() < 4.0);
-                if !on_border {
-                    if let Some(c) = col_at(p.x, sx) {
-                        event = Some(GridEvent::Sort(c));
+            if p.y < top_strip {
+                if let Some(c) = border_at(p.x, sx) {
+                    doc.autofit_col(doc.vcols[c], s.char_width(), s.max_autofit_width);
+                } else if let Some(c) = col_at(p.x, sx) {
+                    let on_header_row = doc.has_header && p.y >= grid.top() + label_h;
+                    if on_header_row && label_h > 0.0 && !doc.read_only {
+                        let text = doc.cell_t(0, doc.vcols[c]);
+                        doc.grid.edit = Some(CellEdit { row: HEADER_ROW, col: c, text, needs_focus: true });
+                    } else {
+                        event = Some(GridEvent::Sort(doc.vcols[c]));
                     }
                 }
             } else if body.contains(p) {
@@ -335,41 +417,42 @@ pub fn show(ui: &mut Ui, doc: &mut Document, find_lc: &str) -> Option<GridEvent>
         }
     }
 
-    // ---------- Keyboard ----------
+    // ---------- Keyboard (navigation + editing; other shortcuts are app commands) ----------
     let focused = ui.memory(|m| m.focused());
     if focused == Some(resp.id) {
         ui.memory_mut(|m| {
-            m.set_focus_lock_filter(
-                resp.id,
-                EventFilter { tab: true, horizontal_arrows: true, vertical_arrows: true, escape: true },
-            )
+            m.set_focus_lock_filter(resp.id, EventFilter { tab: true, horizontal_arrows: true, vertical_arrows: true, escape: true })
         });
     }
     let has_kb = doc.grid.edit.is_none() && (focused.is_none() || focused == Some(resp.id));
-    if has_kb && nrows > 0 {
+    if has_kb && nrows > 0 && ncols_v > 0 {
         let events = ui.input(|i| i.events.clone());
         let last_r = nrows - 1;
-        let last_c = doc.ncols.saturating_sub(1);
+        let last_c = ncols_v - 1;
         for ev in events {
             match ev {
                 Event::Copy => {
-                    if let Some(m) = copy_selection(ui, doc) {
+                    if let Err(m) = copy_selection(ui.ctx(), doc, false) {
                         event = Some(GridEvent::Message(m));
                     }
                 }
-                Event::Cut => {
-                    if let Some(m) = copy_selection(ui, doc) {
-                        event = Some(GridEvent::Message(m));
-                    } else {
+                Event::Cut => match copy_selection(ui.ctx(), doc, false) {
+                    Err(m) => event = Some(GridEvent::Message(m)),
+                    Ok(()) if !doc.read_only => {
                         clear_selection(doc);
+                        event = Some(GridEvent::Edited);
                     }
+                    Ok(()) => {}
+                },
+                Event::Paste(t) if !doc.read_only => {
+                    paste(doc, &t);
+                    event = Some(GridEvent::Edited);
                 }
-                Event::Paste(t) => paste(doc, &t),
-                Event::Text(t) if !mods.command && !mods.ctrl => {
+                Event::Text(t) if !mods.command && !mods.ctrl && !doc.read_only => {
                     start_edit(doc, Some(t));
                     break;
                 }
-                Event::Key { key, pressed: true, modifiers: m, .. } => {
+                Event::Key { key, pressed: true, modifiers: m, .. } if !m.alt => {
                     let (mut r, mut c) = doc.grid.cur;
                     let mut moved = true;
                     match key {
@@ -399,17 +482,20 @@ pub fn show(ui: &mut Ui, doc: &mut Document, find_lc: &str) -> Option<GridEvent>
                         }
                         Key::Tab => {
                             c = if m.shift { c.saturating_sub(1) } else { (c + 1).min(last_c) };
-                            doc.grid.cur = (r, c);
-                            doc.grid.anchor = (r, c);
-                            doc.ensure_visible();
+                            doc.select((r, c), (r, c));
                             continue;
                         }
-                        Key::Enter | Key::F2 => {
+                        Key::Enter | Key::F2 if !m.command => {
                             start_edit(doc, None);
                             break;
                         }
-                        Key::Delete | Key::Backspace => {
+                        Key::E if m.command && !m.shift => {
+                            start_edit(doc, None);
+                            break;
+                        }
+                        Key::Delete | Key::Backspace if !m.command && !doc.read_only => {
                             clear_selection(doc);
+                            event = Some(GridEvent::Edited);
                             moved = false;
                         }
                         Key::Escape => {
@@ -419,21 +505,6 @@ pub fn show(ui: &mut Ui, doc: &mut Document, find_lc: &str) -> Option<GridEvent>
                         Key::A if m.command => {
                             doc.grid.anchor = (0, 0);
                             doc.grid.cur = (last_r, last_c);
-                            moved = false;
-                        }
-                        Key::Z if m.command && m.shift => {
-                            let at = doc.redo();
-                            jump_to_change(doc, at);
-                            moved = false;
-                        }
-                        Key::Z if m.command => {
-                            let at = doc.undo();
-                            jump_to_change(doc, at);
-                            moved = false;
-                        }
-                        Key::Y if m.command => {
-                            let at = doc.redo();
-                            jump_to_change(doc, at);
                             moved = false;
                         }
                         _ => moved = false,
@@ -457,148 +528,194 @@ pub fn show(ui: &mut Ui, doc: &mut Document, find_lc: &str) -> Option<GridEvent>
     let text_col = vis.text_color();
     let weak_col = vis.weak_text_color();
     let line_col = vis.widgets.noninteractive.bg_stroke.color;
-    let head_bg = vis.widgets.inactive.bg_fill;
+    let head_bg = vis.widgets.inactive.weak_bg_fill;
+    let label_bg = vis.panel_fill;
     let stripe = vis.faint_bg_color;
-    let sel_fill = vis.selection.bg_fill.gamma_multiply(0.35);
-    let cur_stroke = Stroke::new(2.0, vis.selection.bg_fill);
-    let find_fill = Color32::from_rgba_unmultiplied(255, 190, 0, 70);
+    let accent = vis.selection.stroke.color;
+    let sel_fill = vis.selection.bg_fill.gamma_multiply(0.45);
+    let cross_fill = vis.selection.bg_fill.gamma_multiply(0.15);
+    let cur_stroke = Stroke::new(2.0, accent);
+    let find_fill = Color32::from_rgba_unmultiplied(255, 190, 0, 80);
     let edited_col = Color32::from_rgb(230, 140, 30);
-    let font = FontId::proportional(13.0);
-    let mono = FontId::monospace(11.5);
+    let font = FontId::proportional(s.font_size);
+    let bold = FontId::new(s.font_size, egui::FontFamily::Name("bold".into()));
+    let bold = if ui.fonts(|f| f.families().iter().any(|fam| *fam == bold.family)) { bold } else { font.clone() };
+    let small = FontId::proportional((s.font_size - 2.0).max(9.0));
+    let mono = FontId::monospace((s.font_size - 1.5).max(9.0));
 
     painter.rect_filled(rect, 0.0, vis.extreme_bg_color);
 
     let first_col = prefix.partition_point(|&p| p <= sx).saturating_sub(1);
     let mut last_col = first_col;
-    while last_col < doc.ncols && prefix[last_col] - sx < body.width() {
+    while last_col < ncols_v && prefix[last_col] - sx < body.width() {
         last_col += 1;
     }
-    let ((sr0, sc0), (sr1, sc1)) = sel_range(doc);
+    let ((sr0, sc0), (sr1, sc1)) = doc.sel_range();
+    let multi = (sr0, sc0) != (sr1, sc1);
     let cur = doc.grid.cur;
     let body_painter = painter.with_clip_rect(body);
     let row_end = (top + vis_rows + 1).min(nrows);
+    let snap = doc.snap();
+    let edits_any = !doc.edits.is_empty() || doc.rows.is_some();
 
-    let mut widest = doc.ncols;
-    for r in top..row_end {
-        let y = body.top() + (r - top) as f32 * ROW_H;
-        let rec = doc.rec_of(r);
-        let fields = doc.row_fields(rec);
-        widest = widest.max(fields.len());
-        let row_rect = Rect::from_min_size(pos2(body.left(), y), vec2(body.width(), ROW_H));
-        if r % 2 == 1 {
+    let mut widest_disk = 0usize;
+    for vr in top..row_end {
+        let y = body.top() + (vr - top) as f32 * row_h;
+        let d = doc.vrow_to_data(vr);
+        if d == usize::MAX || d >= doc.nrows() {
+            continue;
+        }
+        let id = doc.data_row_id(d);
+        if doc.rows.is_none() {
+            widest_disk = widest_disk.max(snap.disk_fields(id).len());
+        }
+        let vals = snap.row_values(id);
+        let row_rect = Rect::from_min_size(pos2(body.left(), y), vec2(body.width(), row_h));
+        if s.shade_rows && vr % 2 == 1 {
             body_painter.rect_filled(row_rect, 0.0, stripe);
         }
-        for c in first_col..last_col {
-            let x = body.left() + prefix[c] - sx;
-            let cell = Rect::from_min_size(pos2(x, y), vec2(doc.col_widths[c], ROW_H));
-            if r >= sr0 && r <= sr1 && c >= sc0 && c <= sc1 && (sr0, sc0) != (sr1, sc1) {
+        if s.highlight_cursor_cross && !multi && vr == cur.0 {
+            body_painter.rect_filled(row_rect, 0.0, cross_fill);
+        }
+        for vc in first_col..last_col {
+            let x = body.left() + prefix[vc] - sx;
+            let cell = Rect::from_min_size(pos2(x, y), vec2(widths[vc], row_h));
+            if s.shade_cols && vc % 2 == 1 {
+                body_painter.rect_filled(cell, 0.0, stripe);
+            }
+            if s.highlight_cursor_cross && !multi && vc == cur.1 && vr != cur.0 {
+                body_painter.rect_filled(cell, 0.0, cross_fill);
+            }
+            if multi && vr >= sr0 && vr <= sr1 && vc >= sc0 && vc <= sc1 {
                 body_painter.rect_filled(cell, 0.0, sel_fill);
             }
-            let Some(v) = fields.get(c) else { continue };
-            if v.is_empty() {
-                continue;
-            }
-            if !find_lc.is_empty() && contains_ci(v, find_lc) {
-                body_painter.rect_filled(cell, 0.0, find_fill);
-            }
-            if doc.is_edited(rec, c) {
+            let c = doc.vcols[vc];
+            let Some(v) = vals.get(c) else { continue };
+            if edits_any && doc.is_edited(id, doc.cols[c]) {
                 body_painter.rect_filled(
-                    Rect::from_min_size(cell.left_top() + vec2(1.0, 1.0), vec2(3.0, ROW_H - 2.0)),
+                    Rect::from_min_size(cell.left_top() + vec2(1.0, 2.0), vec2(2.5, row_h - 4.0)),
                     0.0,
                     edited_col,
                 );
+            }
+            if v.is_empty() {
+                continue;
+            }
+            if let Some(re) = find_re {
+                if re.is_match(v) {
+                    body_painter.rect_filled(cell, 0.0, find_fill);
+                }
             }
             let clip = cell.shrink2(vec2(5.0, 0.0)).intersect(body);
             let p = painter.with_clip_rect(clip);
             if looks_numeric(v) {
                 p.text(pos2(clip.right(), cell.center().y), Align2::RIGHT_CENTER, v.trim(), font.clone(), text_col);
+            } else if rtl::has_rtl(v) {
+                // Shaped + bidi-reordered for display; right-aligned when the text starts RTL.
+                let shown = rtl::visual(&display_text(v)).into_owned();
+                if rtl::is_rtl_paragraph(v) {
+                    p.text(pos2(clip.right(), cell.center().y), Align2::RIGHT_CENTER, shown, font.clone(), text_col);
+                } else {
+                    p.text(pos2(clip.left(), cell.center().y), Align2::LEFT_CENTER, shown, font.clone(), text_col);
+                }
             } else {
                 p.text(pos2(clip.left(), cell.center().y), Align2::LEFT_CENTER, display_text(v), font.clone(), text_col);
             }
         }
     }
-    if widest > doc.ncols {
-        doc.ensure_cols(widest);
+    if widest_disk > doc.disk_cols as usize {
+        doc.ensure_disk_cols(widest_disk);
     }
 
     // Grid lines
-    for c in first_col..=last_col.min(doc.ncols) {
-        let x = (body.left() + prefix[c] - sx).round() - 0.5;
+    let line = Stroke::new(1.0, line_col);
+    for vc in first_col..=last_col.min(ncols_v) {
+        let x = (body.left() + prefix[vc] - sx).round() - 0.5;
         if x >= body.left() {
-            painter.vline(x, grid.top()..=grid.bottom(), Stroke::new(1.0, line_col));
+            painter.vline(x, grid.top()..=grid.bottom(), line);
         }
     }
-    for i in 0..=(row_end - top) {
-        let y = (body.top() + i as f32 * ROW_H).round() - 0.5;
+    for i in 0..=(row_end.saturating_sub(top)) {
+        let y = (body.top() + i as f32 * row_h).round() - 0.5;
         painter.hline(grid.left()..=grid.right(), y, Stroke::new(1.0, line_col.gamma_multiply(0.5)));
     }
 
     // Cursor
-    if cur.0 >= top && cur.0 < row_end && cur.1 < doc.ncols {
+    if cur.0 >= top && cur.0 < row_end && cur.1 < ncols_v {
         let x = body.left() + prefix[cur.1] - sx;
-        let y = body.top() + (cur.0 - top) as f32 * ROW_H;
-        let cell = Rect::from_min_size(pos2(x, y), vec2(doc.col_widths[cur.1], ROW_H));
+        let y = body.top() + (cur.0 - top) as f32 * row_h;
+        let cell = Rect::from_min_size(pos2(x, y), vec2(widths[cur.1], row_h));
         body_painter.rect_stroke(cell.shrink(1.0), 0.0, cur_stroke, StrokeKind::Inside);
     }
 
-    // Header row
-    let head = Rect::from_min_max(pos2(body.left(), grid.top()), pos2(grid.right(), body.top()));
-    painter.rect_filled(Rect::from_min_max(grid.left_top(), head.right_bottom()), 0.0, head_bg);
-    let names = doc.column_names();
-    let head_painter = painter.with_clip_rect(head);
-    for c in first_col..last_col {
-        let x = body.left() + prefix[c] - sx;
-        let cell = Rect::from_min_size(pos2(x, grid.top()), vec2(doc.col_widths[c], HEAD_H));
-        if c >= sc0 && c <= sc1 {
-            head_painter.rect_filled(cell, 0.0, sel_fill);
-        }
-        let mut label = match names.get(c) {
-            Some(n) if !n.is_empty() => display_text(n),
-            _ => col_letter(c),
-        };
-        let mut col = text_col;
-        if let Some((sc, asc)) = doc.sort {
-            if sc == c {
-                label.push_str(if asc { "  ▲" } else { "  ▼" });
-                col = vis.selection.stroke.color;
+    // Column label strip + header row
+    let strip = Rect::from_min_max(pos2(body.left(), grid.top()), pos2(grid.right(), body.top()));
+    painter.rect_filled(Rect::from_min_max(grid.left_top(), strip.right_bottom()), 0.0, label_bg);
+    let names = if doc.has_header { snap.header_names() } else { Vec::new() };
+    let strip_painter = painter.with_clip_rect(strip);
+    for vc in first_col..last_col {
+        let x = body.left() + prefix[vc] - sx;
+        let c = doc.vcols[vc];
+        let col_id = doc.cols[c];
+        let sorted = doc.sort.filter(|(sc, _)| *sc == col_id).map(|(_, asc)| if asc { " ▲" } else { " ▼" }).unwrap_or("");
+        let filtered = if doc.filters.iter().any(|f| f.col == Some(col_id)) { " ⏷" } else { "" };
+        let selected = vc >= sc0 && vc <= sc1;
+        if label_h > 0.0 {
+            let cell = Rect::from_min_size(pos2(x, grid.top()), vec2(widths[vc], label_h));
+            if selected {
+                strip_painter.rect_filled(cell, 0.0, sel_fill);
             }
+            let mut label = if s.col_letters { col_letter(c) } else { (c as i64 + s.first_col_index).to_string() };
+            if !doc.has_header {
+                label.push_str(sorted);
+                label.push_str(filtered);
+            }
+            painter.with_clip_rect(cell.intersect(strip)).text(cell.center(), Align2::CENTER_CENTER, label, small.clone(), weak_col);
+            strip_painter.vline(cell.right().round() - 0.5, cell.y_range(), line);
         }
-        if doc.applied_filter.as_ref().is_some_and(|(_, fc)| *fc == Some(c)) {
-            label.push_str("  ⏷");
+        if doc.has_header {
+            let cell = Rect::from_min_size(pos2(x, grid.top() + label_h), vec2(widths[vc], head_h));
+            strip_painter.rect_filled(cell, 0.0, head_bg);
+            if selected {
+                strip_painter.rect_filled(cell, 0.0, sel_fill);
+            }
+            let raw_name = names.get(c).map(String::as_str).unwrap_or("");
+            let mut label = rtl::visual(&display_text(raw_name)).into_owned();
+            label.push_str(sorted);
+            label.push_str(filtered);
+            let clip = cell.shrink2(vec2(6.0, 0.0)).intersect(strip);
+            let color = if sorted.is_empty() { text_col } else { accent };
+            painter.with_clip_rect(clip).text(pos2(clip.left(), cell.center().y), Align2::LEFT_CENTER, label, bold.clone(), color);
+            strip_painter.vline(cell.right().round() - 0.5, cell.y_range(), line);
         }
-        let clip = cell.shrink2(vec2(6.0, 0.0)).intersect(head);
-        painter.with_clip_rect(clip).text(
-            pos2(clip.left(), cell.center().y),
-            Align2::LEFT_CENTER,
-            label,
-            FontId::proportional(13.0),
-            col,
-        );
-        head_painter.vline(cell.right().round() - 0.5, cell.y_range(), Stroke::new(1.0, line_col));
     }
-    painter.hline(grid.left()..=grid.right(), body.top() - 0.5, Stroke::new(1.0, line_col));
+    if label_h > 0.0 && head_h > 0.0 {
+        painter.hline(grid.left()..=grid.right(), grid.top() + label_h - 0.5, line);
+    }
+    painter.hline(grid.left()..=grid.right(), body.top() - 0.5, Stroke::new(1.0, accent.gamma_multiply(0.5)));
 
-    // Row numbers
-    let rn = Rect::from_min_max(pos2(grid.left(), body.top()), pos2(body.left(), grid.bottom()));
-    painter.rect_filled(rn, 0.0, head_bg);
-    let first = doc.first_rec();
-    for r in top..row_end {
-        let y = body.top() + (r - top) as f32 * ROW_H;
-        let cell = Rect::from_min_size(pos2(rn.left(), y), vec2(rn_w, ROW_H));
-        if r >= sr0 && r <= sr1 {
-            painter.rect_filled(cell, 0.0, sel_fill);
+    // Row labels
+    if rn_w > 0.0 {
+        let rn = Rect::from_min_max(pos2(grid.left(), body.top()), pos2(body.left(), grid.bottom()));
+        painter.rect_filled(rn, 0.0, label_bg);
+        for vr in top..row_end {
+            let y = body.top() + (vr - top) as f32 * row_h;
+            let cell = Rect::from_min_size(pos2(rn.left(), y), vec2(rn_w, row_h));
+            if vr >= sr0 && vr <= sr1 {
+                painter.rect_filled(cell, 0.0, sel_fill);
+            }
+            let d = doc.vrow_to_data(vr);
+            let label = (d as i64 + s.first_row_index).to_string();
+            painter.text(pos2(cell.right() - 6.0, cell.center().y), Align2::RIGHT_CENTER, label, mono.clone(), weak_col);
         }
-        let label = (doc.rec_of(r) - first + 1).to_string();
-        painter.text(pos2(cell.right() - 6.0, cell.center().y), Align2::RIGHT_CENTER, label, mono.clone(), weak_col);
+        painter.vline(body.left() - 0.5, grid.y_range(), line);
     }
-    painter.vline(body.left() - 0.5, grid.y_range(), Stroke::new(1.0, line_col));
 
     // Scrollbars
-    let track = vis.extreme_bg_color;
     let thumb = vis.widgets.inactive.fg_stroke.color.gamma_multiply(0.45);
-    painter.rect_filled(vs_rect, 0.0, track);
-    painter.rect_filled(hs_rect, 0.0, track);
-    painter.rect_filled(Rect::from_min_max(grid.right_bottom(), rect.right_bottom()), 0.0, head_bg);
+    painter.rect_filled(vs_rect, 0.0, vis.extreme_bg_color);
+    painter.rect_filled(hs_rect, 0.0, vis.extreme_bg_color);
+    painter.rect_filled(Rect::from_min_max(grid.right_bottom(), rect.right_bottom()), 0.0, label_bg);
     if max_top > 0 {
         let h = (vs_rect.height() * vis_rows as f32 / nrows as f32).clamp(24.0, vs_rect.height());
         let t = top as f64 / max_top as f64;
@@ -611,24 +728,22 @@ pub fn show(ui: &mut Ui, doc: &mut Document, find_lc: &str) -> Option<GridEvent>
         painter.rect_filled(Rect::from_min_size(pos2(x, hs_rect.top() + 2.0), vec2(w, SB - 4.0)), 4.0, thumb);
     }
 
-    if nrows == 0 && doc.index.is_done() {
-        painter.text(body.center(), Align2::CENTER_CENTER, "No rows", FontId::proportional(14.0), weak_col);
+    if nrows == 0 && doc.ready() {
+        let msg = if doc.has_view_filter() { "No rows match the filters" } else { "No rows" };
+        painter.text(body.center(), Align2::CENTER_CENTER, msg, FontId::proportional(14.0), weak_col);
     }
 
     // ---------- In-place editor ----------
-    let mut finish: Option<bool> = None; // Some(true)=commit, Some(false)=cancel
+    let mut finish: Option<bool> = None;
     if let Some(edit) = &mut doc.grid.edit {
-        let visible = edit.row >= top && edit.row < top + vis_rows && edit.col < doc.ncols;
-        if !visible {
+        let in_view = edit.col < ncols_v && (edit.row == HEADER_ROW || (edit.row >= top && edit.row < top + vis_rows));
+        if !in_view {
             finish = Some(true);
         } else {
             let x = body.left() + prefix[edit.col] - sx;
-            let y = body.top() + (edit.row - top) as f32 * ROW_H;
-            let cell = Rect::from_min_size(pos2(x, y), vec2(doc.col_widths[edit.col].max(160.0), ROW_H));
-            let te = ui.put(
-                cell,
-                TextEdit::singleline(&mut edit.text).font(font.clone()).margin(vec2(4.0, 2.0)),
-            );
+            let y = if edit.row == HEADER_ROW { grid.top() + label_h } else { body.top() + (edit.row - top) as f32 * row_h };
+            let cell = Rect::from_min_size(pos2(x, y), vec2(widths[edit.col].max(180.0), row_h));
+            let te = ui.put(cell, TextEdit::singleline(&mut edit.text).font(font.clone()).margin(vec2(4.0, 2.0)));
             if edit.needs_focus {
                 te.request_focus();
                 edit.needs_focus = false;
@@ -643,12 +758,15 @@ pub fn show(ui: &mut Ui, doc: &mut Document, find_lc: &str) -> Option<GridEvent>
         Some(true) => {
             let tab = ui.input(|i| i.key_pressed(Key::Tab));
             let enter = ui.input(|i| i.key_pressed(Key::Enter));
-            commit_edit(doc);
-            if nrows > 0 {
+            let was_header = doc.grid.edit.as_ref().is_some_and(|e| e.row == HEADER_ROW);
+            if commit_edit(doc) {
+                event = Some(GridEvent::Edited);
+            }
+            if nrows > 0 && !was_header {
                 if enter {
                     doc.grid.cur.0 = (doc.grid.cur.0 + 1).min(nrows - 1);
                 } else if tab {
-                    doc.grid.cur.1 = (doc.grid.cur.1 + 1).min(doc.ncols - 1);
+                    doc.grid.cur.1 = (doc.grid.cur.1 + 1).min(ncols_v.saturating_sub(1));
                 }
                 doc.grid.anchor = doc.grid.cur;
                 doc.ensure_visible();
@@ -658,5 +776,5 @@ pub fn show(ui: &mut Ui, doc: &mut Document, find_lc: &str) -> Option<GridEvent>
         None => {}
     }
 
-    event
+    GridOut { event, response: resp }
 }

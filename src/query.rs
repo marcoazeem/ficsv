@@ -4,6 +4,7 @@
 //! * `foo*bar`    wildcard, whole cell must match
 //! * `a | b`      OR,  `a & b`  AND,  `!a`  NOT
 //! * `>5` `<=10`  numeric comparison, `50+` (>= 50), `50-` (<= 50), `10-20` inclusive range
+//! * `=foo`       cell equals "foo" (case-insensitive); `!` alone = not empty
 //! * `#regex`     the whole query is a (case-sensitive) regular expression
 //! * `\|` `\&` `\*` escape special characters
 
@@ -20,6 +21,8 @@ struct Term {
 
 enum Pred {
     Contains(String),
+    Exact(String),
+    Empty,
     Pattern(Regex),
     Cmp(Op, f64),
     Range(f64, f64),
@@ -109,6 +112,12 @@ fn parse_term(t: &str) -> Result<Term, String> {
 }
 
 fn parse_pred(t: &str) -> Result<Pred, String> {
+    if t.is_empty() {
+        return Ok(Pred::Empty);
+    }
+    if let Some(rest) = t.strip_prefix('=') {
+        return Ok(Pred::Exact(unescape(rest).to_lowercase()));
+    }
     for (prefix, op) in [(">=", Op::Ge), ("<=", Op::Le), (">", Op::Gt), ("<", Op::Lt)] {
         if let Some(v) = t.strip_prefix(prefix).and_then(num) {
             return Ok(Pred::Cmp(op, v));
@@ -158,6 +167,31 @@ fn parse_pred(t: &str) -> Result<Pred, String> {
     }
 }
 
+fn unescape(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            out.push(chars.next().unwrap_or('\\'));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Escape a literal value for use in a query term.
+pub fn escape_value(v: &str) -> String {
+    let mut out = String::new();
+    for c in v.chars() {
+        if matches!(c, '\\' | '|' | '&' | '*') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 pub fn contains_ci(hay: &str, needle_lc: &str) -> bool {
     if needle_lc.is_empty() {
         return true;
@@ -176,6 +210,8 @@ impl Pred {
     fn test(&self, f: &str) -> bool {
         match self {
             Pred::Contains(n) => contains_ci(f, n),
+            Pred::Exact(n) => f.to_lowercase() == *n,
+            Pred::Empty => f.trim().is_empty(),
             Pred::Pattern(r) => r.is_match(f),
             Pred::Cmp(op, v) => match num(f) {
                 Some(x) => match op {
@@ -216,5 +252,11 @@ mod tests {
         assert!(!m("f*r", &["xfoobar"]));
         assert!(m("#^\\d+$", &["123"]));
         assert!(m("a\\|b", &["a|b"]));
+        assert!(m("=abc", &["ABC"]));
+        assert!(!m("=ab", &["abc"]));
+        assert!(m("!", &["x"]));
+        assert!(!m("!", &[""]));
+        let v = escape_value("a|b&c*\\");
+        assert!(m(&format!("={v}"), &["a|b&c*\\"]));
     }
 }

@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 chrono = "0.4.45"
 eframe = "0.35.0"
+egui = "0.35"
 encoding_rs = "0.8.44"
 memchr = "2.8.3"
 memmap2 = "0.9.12"
@@ -15,5 +16,12 @@ rand = "0.10.4"
 rayon = "1.12.0"
 regex = "1.13.2"
 rfd = "0.18.0"
+serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
+unicode-bidi = "0.3.18"
 uuid = { version = "1.29.3", features = ["v4", "v7"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = true
