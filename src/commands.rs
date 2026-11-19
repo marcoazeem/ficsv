@@ -213,7 +213,7 @@ commands! {
     EmailAddresses => ("Email Selected Email Addresses", "Web", None),
 
     // ---- Help ----
-    About => ("About ficsv", "Help", None),
+    About => ("About FI CSV", "Help", None),
 }
 
 /// Commands that edit the grid and must not fire while typing in a text field.

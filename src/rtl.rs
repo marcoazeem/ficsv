@@ -207,9 +207,27 @@ pub fn install_fonts(ctx: &egui::Context, faruma_override: &str) -> Option<Strin
         ]
     };
     let mut fonts = egui::FontDefinitions::default();
+    // UI typeface (Inter, OFL) + icon font (Phosphor, MIT), bundled.
+    let semibold = egui::FontFamily::Name("semibold".into());
+    for (name, bytes) in [
+        ("inter", &include_bytes!("../assets/fonts/Inter-Regular.ttf")[..]),
+        ("inter-semibold", &include_bytes!("../assets/fonts/Inter-SemiBold.ttf")[..]),
+        ("phosphor", &include_bytes!("../assets/fonts/Phosphor.ttf")[..]),
+    ] {
+        fonts.font_data.insert(name.into(), Arc::new(egui::FontData::from_static(bytes)));
+    }
+    let defaults = fonts.families.get(&egui::FontFamily::Proportional).cloned().unwrap_or_default();
+    let prop = fonts.families.entry(egui::FontFamily::Proportional).or_default();
+    prop.insert(0, "inter".into());
+    // Icons get their own family: Phosphor also maps a-z (ligatures) and Inter has glyphs in
+    // the private-use range, so neither may sit in front of the other.
+    fonts.families.insert(egui::FontFamily::Name("icons".into()), vec!["phosphor".into()]);
+    let mut sb = vec!["inter-semibold".to_string()];
+    sb.extend(defaults);
+    fonts.families.insert(semibold.clone(), sb);
     let add = |fonts: &mut egui::FontDefinitions, name: String, bytes: Vec<u8>| {
         fonts.font_data.insert(name.clone(), Arc::new(egui::FontData::from_owned(bytes)));
-        for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace, egui::FontFamily::Name("semibold".into())] {
             fonts.families.entry(fam).or_default().push(name.clone());
         }
     };

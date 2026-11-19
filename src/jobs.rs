@@ -38,6 +38,7 @@ pub struct Job {
     pub label: String,
     pub cancel: Arc<AtomicBool>,
     pub rx: Receiver<JobResult>,
+    #[allow(dead_code)]
     pub started: Instant,
 }
 

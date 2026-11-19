@@ -18,8 +18,10 @@ use crate::query::{escape_value, Query};
 use crate::settings::{config_dir, ExternalChange, Settings, Theme};
 use crate::table::{col_letter, Param, ParamKind, ParamValues, TableRead};
 use crate::transforms;
+use crate::ui_kit;
 
 const MAX_BLOCK: usize = 5_000_000;
+pub const APP_NAME: &str = "FI CSV";
 
 const ENCODINGS: &[&str] = &[
     "UTF-8", "UTF-16LE", "UTF-16BE", "windows-1252", "ISO-8859-1", "ISO-8859-2", "ISO-8859-15", "windows-1250", "windows-1251",
@@ -109,6 +111,10 @@ pub struct App {
     last_mtime_check: Instant,
     folder_files: Vec<PathBuf>,
     applied_theme: Option<(Theme, f32)>,
+    logo: Option<egui::TextureHandle>,
+    window_title: String,
+    /// Paths still being saved before their tabs close (and whether to quit afterwards).
+    close_after_save: Option<(HashSet<PathBuf>, bool)>,
 }
 
 fn fmt_num(n: usize) -> String {
@@ -213,6 +219,9 @@ impl App {
             last_mtime_check: Instant::now(),
             folder_files: Vec::new(),
             applied_theme: None,
+            logo: None,
+            window_title: String::new(),
+            close_after_save: None,
         };
         app.rescan_folders();
         if let Some(w) = font_warning {
@@ -518,8 +527,25 @@ impl App {
                 self.docs.insert(i, d);
                 self.active = i;
                 if renamed.is_ok() {
-                    self.msg(format!("Saved {}", target.display()));
+                    self.msg(format!("Saved {}", target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()));
                     self.settings.push_recent(&target);
+                    // Part of "Save" in the unsaved-changes dialog: close the tab (and quit) once saved.
+                    if let Some((waiting, quit)) = &mut self.close_after_save {
+                        if waiting.remove(&target) {
+                            self.docs.remove(i);
+                            self.active = self.active.min(self.docs.len().saturating_sub(1));
+                            if waiting.is_empty() {
+                                let quit = *quit;
+                                self.close_after_save = None;
+                                if quit {
+                                    self.allow_quit = true;
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    self.close_after_save = None;
                 }
             }
             Err(e) => self.msg(format!("Saved, but reopening failed: {e}")),
@@ -600,6 +626,7 @@ impl App {
             }
             JobResult::Error(e) => {
                 self.msg(e);
+                self.close_after_save = None; // a failed save cancels "save and close"
                 return;
             }
             JobResult::Done(m) => {
@@ -1970,10 +1997,164 @@ impl App {
             return;
         }
         self.applied_theme = Some(key);
-        let v = self.settings.theme.visuals();
-        let dark = v.dark_mode;
-        ctx.set_theme(if dark { egui::Theme::Dark } else { egui::Theme::Light });
-        ctx.set_visuals_of(if dark { egui::Theme::Dark } else { egui::Theme::Light }, v);
+        ui_kit::apply_style(ctx, self.settings.theme, self.settings.font_size);
+    }
+
+    fn logo(&mut self, ctx: &Context) -> egui::TextureHandle {
+        self.logo
+            .get_or_insert_with(|| {
+                let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon/icon-256.png")).unwrap_or_default();
+                let img = egui::ColorImage::from_rgba_unmultiplied([icon.width as usize, icon.height as usize], &icon.rgba);
+                ctx.load_texture("logo", img, egui::TextureOptions::LINEAR)
+            })
+            .clone()
+    }
+
+    fn toolbar(&mut self, ui: &mut Ui) {
+        use ui_kit::{divider, icon, tool_button};
+        let ctx = ui.ctx().clone();
+        let d = self.docs.get(self.active);
+        let has = d.is_some();
+        let can_undo = d.is_some_and(|d| !d.undo.is_empty());
+        let can_redo = d.is_some_and(|d| !d.redo.is_empty());
+        let dirty = d.is_some_and(|d| d.dirty);
+        let nf = d.map_or(0, |d| d.filters.len());
+        let mut fire = None;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            let mut t = |ui: &mut Ui, ic: &str, c: Cmd, enabled: bool| {
+                let sc = commands::shortcut_text(&ctx, c);
+                let tip = if sc.is_empty() { c.name().to_string() } else { format!("{}   {sc}", c.name()) };
+                if tool_button(ui, ic, &tip, enabled).clicked() {
+                    fire = Some(c);
+                }
+            };
+            t(ui, icon::FILE_PLUS, Cmd::NewFile, true);
+            t(ui, icon::FOLDER_OPEN, Cmd::OpenFile, true);
+            t(ui, icon::FLOPPY_DISK, Cmd::SaveFile, has && dirty);
+            divider(ui);
+            t(ui, icon::UNDO, Cmd::Undo, can_undo);
+            t(ui, icon::REDO, Cmd::Redo, can_redo);
+            divider(ui);
+            t(ui, icon::SEARCH, Cmd::Find, has);
+            t(ui, icon::FUNNEL, Cmd::AddFilter, has);
+            if nf > 0 {
+                t(ui, icon::FUNNEL_X, Cmd::RemoveFilters, true);
+            }
+            t(ui, icon::SORT_ASC, Cmd::SortColAsc, has);
+            t(ui, icon::SORT_DESC, Cmd::SortColDesc, has);
+            divider(ui);
+            t(ui, icon::PLUS, Cmd::InsertRowsAfter, has);
+            t(ui, icon::TRASH, Cmd::RemoveRows, has);
+            t(ui, icon::MAGIC, Cmd::Transform, has);
+            t(ui, icon::CHART_BAR, Cmd::OpenAnalysis, has);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                t(ui, icon::GEAR, Cmd::Preferences, true);
+                t(ui, icon::SIDEBAR, Cmd::ToggleSidebar, true);
+                t(ui, icon::COMMAND, Cmd::CommandPalette, true);
+            });
+        });
+        if let Some(c) = fire {
+            self.run(&ctx, c);
+        }
+    }
+
+    fn welcome(&mut self, ui: &mut Ui) {
+        use ui_kit::icon;
+        let ctx = ui.ctx().clone();
+        let logo = self.logo(&ctx);
+        let mut action: Option<PalItem> = None;
+        let v = ui.visuals().clone();
+        ui.vertical_centered(|ui| {
+            ui.add_space((ui.available_height() * 0.16).max(24.0));
+            ui.add(egui::Image::new(&logo).fit_to_exact_size(egui::vec2(88.0, 88.0)));
+            ui.add_space(10.0);
+            ui.label(RichText::new(APP_NAME).font(ui_kit::semibold(28.0)));
+            ui.label(RichText::new("Fast CSV editor for big files").color(v.weak_text_color()));
+            ui.add_space(22.0);
+            let w = 2.0 * 150.0 + 10.0;
+            ui.allocate_ui_with_layout(egui::vec2(w, 36.0), Layout::left_to_right(Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                let a = ui_kit::accent(ui);
+                let open = egui::Button::new((ui_kit::icon_text(icon::FOLDER_OPEN, 16.0).color(Color32::WHITE), RichText::new("Open File…").color(Color32::WHITE).font(ui_kit::semibold(14.0))))
+                    .fill(a)
+                    .corner_radius(8)
+                    .min_size(egui::vec2(150.0, 36.0));
+                if ui.add(open).clicked() {
+                    action = Some(PalItem::Cmd(Cmd::OpenFile));
+                }
+                let new = egui::Button::new((ui_kit::icon_text(icon::FILE_PLUS, 16.0), RichText::new("New File").size(14.0))).corner_radius(8).min_size(egui::vec2(150.0, 36.0));
+                if ui.add(new).clicked() {
+                    action = Some(PalItem::Cmd(Cmd::NewFile));
+                }
+            });
+            let recent: Vec<String> = self.settings.recent.iter().filter(|r| Path::new(r).exists()).take(8).cloned().collect();
+            if !recent.is_empty() {
+                ui.add_space(30.0);
+                ui.allocate_ui_with_layout(egui::vec2(460.0, 0.0), Layout::top_down(Align::Min), |ui| {
+                    ui_kit::section(ui, "Recent");
+                    for r in recent {
+                        let p = Path::new(&r);
+                        let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        let dir = p.parent().map(|d| d.display().to_string()).unwrap_or_default();
+                        let (rect, resp) = ui.allocate_exact_size(egui::vec2(460.0, 40.0), egui::Sense::click());
+                        if resp.hovered() {
+                            ui.painter().rect_filled(rect, 8, v.widgets.hovered.weak_bg_fill);
+                        }
+                        let pnt = ui.painter();
+                        pnt.text(egui::pos2(rect.left() + 12.0, rect.center().y), egui::Align2::LEFT_CENTER, icon::FILE_TEXT, ui_kit::icon_font(18.0), ui_kit::accent(ui));
+                        pnt.text(egui::pos2(rect.left() + 40.0, rect.top() + 12.0), egui::Align2::LEFT_CENTER, name, egui::FontId::proportional(13.5), v.text_color());
+                        let clip = rect.shrink2(egui::vec2(8.0, 0.0));
+                        pnt.with_clip_rect(clip).text(egui::pos2(rect.left() + 40.0, rect.top() + 28.0), egui::Align2::LEFT_CENTER, dir, egui::FontId::proportional(11.5), v.weak_text_color());
+                        if resp.clicked() {
+                            action = Some(PalItem::File(PathBuf::from(&r)));
+                        }
+                    }
+                });
+            }
+            ui.add_space(26.0);
+            let hint = format!("Drop a CSV anywhere  ·  {} for all commands", commands::shortcut_text(&ctx, Cmd::CommandPalette));
+            ui.label(RichText::new(hint).size(12.0).color(v.weak_text_color()));
+        });
+        if let Some(a) = action {
+            self.run_item(&ctx, a);
+        }
+    }
+
+    fn save_and_close(&mut self, ctx: &Context, tabs: Vec<usize>, quit: bool) {
+        let mut waiting = HashSet::new();
+        let mut close_now = Vec::new();
+        for &i in &tabs {
+            let Some(d) = self.docs.get(i) else { continue };
+            if !d.dirty {
+                close_now.push(i);
+                continue;
+            }
+            let target = match (&d.path, d.read_only) {
+                (Some(p), false) => p.clone(),
+                _ => match rfd::FileDialog::new().set_file_name(d.title()).save_file() {
+                    Some(p) => p,
+                    None => return, // cancelled: keep everything open
+                },
+            };
+            waiting.insert(target.clone());
+            self.save(ctx, i, Some(target), false);
+        }
+        close_now.sort_unstable();
+        for i in close_now.into_iter().rev() {
+            if i < self.docs.len() && self.docs[i].aux_job.is_none() {
+                self.docs.remove(i);
+            }
+        }
+        self.active = self.active.min(self.docs.len().saturating_sub(1));
+        if waiting.is_empty() {
+            if quit {
+                self.allow_quit = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        } else {
+            self.close_after_save = Some((waiting, quit));
+        }
     }
 
     fn handle_shortcuts(&mut self, ctx: &Context) {
@@ -2068,106 +2249,181 @@ impl App {
     }
 
     fn tab_bar(&mut self, ui: &mut Ui) {
+        use egui::{pos2, vec2, CornerRadius, FontId, Sense, Stroke};
         let mut close = None;
-        ui.horizontal_wrapped(|ui| {
-            for i in 0..self.docs.len() {
-                let d = &self.docs[i];
-                let mut title = d.title();
-                if d.dirty {
-                    title.push_str(" ●");
+        let mut activate = None;
+        let mut new = false;
+        let v = ui.visuals().clone();
+        let accent = v.selection.stroke.color;
+        egui::ScrollArea::horizontal().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                for i in 0..self.docs.len() {
+                    let d = &self.docs[i];
+                    let active = i == self.active;
+                    let title = d.title();
+                    let font = if active { ui_kit::semibold(13.0) } else { FontId::proportional(13.0) };
+                    let text_w = ui.painter().layout_no_wrap(title.clone(), font.clone(), Color32::WHITE).size().x;
+                    let lock_w = if d.read_only { 18.0 } else { 0.0 };
+                    let w = (text_w + lock_w + 50.0).clamp(96.0, 260.0);
+                    let (rect, resp) = ui.allocate_exact_size(vec2(w, 32.0), Sense::click());
+                    let x_rect = egui::Rect::from_center_size(pos2(rect.right() - 16.0, rect.center().y), vec2(20.0, 20.0));
+                    let x_resp = ui.interact(x_rect, egui::Id::new(("tab-x", i)), Sense::click());
+                    let hovered = resp.hovered() || x_resp.hovered();
+                    let p = ui.painter();
+                    let top = CornerRadius { nw: 8, ne: 8, sw: 0, se: 0 };
+                    if active {
+                        p.rect_filled(rect, top, v.extreme_bg_color);
+                        p.hline(rect.left() + 6.0..=rect.right() - 6.0, rect.top() + 1.0, Stroke::new(2.0, accent));
+                    } else if hovered {
+                        p.rect_filled(rect.shrink2(vec2(0.0, 3.0)), CornerRadius::same(6), v.widgets.hovered.weak_bg_fill);
+                    }
+                    let fg = if active { v.text_color() } else { v.weak_text_color() };
+                    let mut x = rect.left() + 12.0;
+                    if d.read_only {
+                        p.text(pos2(x, rect.center().y), egui::Align2::LEFT_CENTER, ui_kit::icon::LOCK, ui_kit::icon_font(13.0), fg);
+                        x += lock_w;
+                    }
+                    let clip = egui::Rect::from_min_max(pos2(x, rect.top()), pos2(x_rect.left() - 4.0, rect.bottom()));
+                    p.with_clip_rect(clip).text(pos2(x, rect.center().y), egui::Align2::LEFT_CENTER, &title, font, fg);
+                    if hovered || active {
+                        if x_resp.hovered() {
+                            p.rect_filled(x_rect, CornerRadius::same(4), v.widgets.hovered.weak_bg_fill.gamma_multiply(1.6));
+                        }
+                        if d.dirty && !hovered {
+                            p.circle_filled(x_rect.center(), 4.0, accent);
+                        } else {
+                            p.text(x_rect.center(), egui::Align2::CENTER_CENTER, ui_kit::icon::X, ui_kit::icon_font(13.0), fg);
+                        }
+                    } else if d.dirty {
+                        p.circle_filled(x_rect.center(), 4.0, fg);
+                    }
+                    if x_resp.clicked() || resp.middle_clicked() {
+                        close = Some(i);
+                    } else if resp.clicked() {
+                        activate = Some(i);
+                    }
+                    let tip = d.path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "Not saved yet".into());
+                    resp.on_hover_text(tip);
                 }
-                if d.read_only {
-                    title.push_str(" 🔒");
+                ui.add_space(4.0);
+                if ui_kit::tool_button(ui, ui_kit::icon::PLUS, "New file", true).clicked() {
+                    new = true;
                 }
-                let r = ui.selectable_label(i == self.active, title);
-                if r.clicked() {
-                    self.active = i;
-                }
-                if r.middle_clicked() {
-                    close = Some(i);
-                }
-                if let Some(p) = &d.path {
-                    r.on_hover_text(p.display().to_string());
-                }
-                if ui.small_button("×").clicked() {
-                    close = Some(i);
-                }
-                ui.separator();
-            }
+            });
         });
+        if let Some(i) = activate {
+            self.active = i;
+        }
         if let Some(i) = close {
             self.close_tabs(vec![i]);
+        }
+        if new {
+            let ctx = ui.ctx().clone();
+            self.run(&ctx, Cmd::NewFile);
         }
     }
 
     fn find_bar(&mut self, ui: &mut Ui) {
+        use ui_kit::{chip, icon, tool_button};
         let ctx = ui.ctx().clone();
         let mut action: Option<Cmd> = None;
+        let v = ui.visuals().clone();
+        let field = |ui: &mut Ui, ic: &str, add: &mut dyn FnMut(&mut Ui)| {
+            egui::Frame::new()
+                .fill(v.extreme_bg_color)
+                .stroke(egui::Stroke::new(1.0, v.widgets.noninteractive.bg_stroke.color))
+                .corner_radius(7)
+                .inner_margin(egui::Margin::symmetric(8, 3))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(ui_kit::icon_text(ic, 14.0).color(v.weak_text_color()));
+                        add(ui);
+                    });
+                });
+        };
         ui.horizontal(|ui| {
-            ui.label("Find");
-            let r = ui.add(egui::TextEdit::singleline(&mut self.find.text).desired_width(220.0).hint_text("text or regex"));
-            if self.find_focus {
-                r.request_focus();
-                self.find_focus = false;
+            let mut enter = false;
+            let mut shift = false;
+            let focus = std::mem::take(&mut self.find_focus);
+            let text = &mut self.find.text;
+            field(ui, icon::SEARCH, &mut |ui: &mut Ui| {
+                let r = ui.add(egui::TextEdit::singleline(text).frame(egui::Frame::NONE).desired_width(240.0).hint_text("Find in table"));
+                if focus {
+                    r.request_focus();
+                }
+                if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                    enter = true;
+                    shift = ui.input(|i| i.modifiers.shift);
+                    r.request_focus();
+                }
+            });
+            if enter {
+                action = Some(if shift { Cmd::FindPrev } else { Cmd::FindNext });
             }
-            if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                action = Some(if ui.input(|i| i.modifiers.shift) { Cmd::FindPrev } else { Cmd::FindNext });
-                r.request_focus();
-            }
-            if ui.button("◀").on_hover_text("Previous (Shift+F3)").clicked() {
+            if tool_button(ui, icon::CARET_UP, "Previous match   ⇧F3", true).clicked() {
                 action = Some(Cmd::FindPrev);
             }
-            if ui.button("▶").on_hover_text("Next (F3)").clicked() {
+            if tool_button(ui, icon::CARET_DOWN, "Next match   F3", true).clicked() {
                 action = Some(Cmd::FindNext);
             }
-            if ui.button("Count").clicked() {
-                action = Some(Cmd::FindAll);
-            }
-            ui.toggle_value(&mut self.find.case, "Aa").on_hover_text("Case sensitive");
-            ui.toggle_value(&mut self.find.regex, ".*").on_hover_text("Regular expression");
-            ui.toggle_value(&mut self.find.whole_word, "\\b").on_hover_text("Whole word");
-            ui.toggle_value(&mut self.find.whole_cell, "[ ]").on_hover_text("Whole cell");
-            ui.toggle_value(&mut self.find.selection_only, "Sel").on_hover_text("In selected cells only");
-            ui.toggle_value(&mut self.find.highlight, "🖍").on_hover_text("Highlight matches");
+            ui.add_space(4.0);
+            chip(ui, &mut self.find.case, icon::CASE, "Match case");
+            chip(ui, &mut self.find.whole_word, icon::WORD, "Whole word");
+            chip(ui, &mut self.find.whole_cell, icon::BRACKETS, "Whole cell");
+            chip(ui, &mut self.find.regex, icon::REGEX, "Regular expression");
+            chip(ui, &mut self.find.selection_only, icon::SELECTION, "In selection only");
+            chip(ui, &mut self.find.highlight, icon::HIGHLIGHT, "Highlight matches");
+            ui.add_space(4.0);
             if let Err(e) = self.find.compile() {
-                ui.colored_label(Color32::LIGHT_RED, e.lines().last().unwrap_or("bad regex").to_string());
+                ui.colored_label(v.error_fg_color, e.lines().last().unwrap_or("invalid pattern").to_string());
             } else if let Some(n) = self.find_count {
                 ui.weak(format!("{} matches", fmt_num(n)));
+            } else if !self.find.text.is_empty() && ui.link("Count").clicked() {
+                action = Some(Cmd::FindAll);
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.button("✕").clicked() {
+                if tool_button(ui, icon::X, "Close   Esc", true).clicked() {
                     self.find_open = false;
                     self.replace_open = false;
                 }
-                ui.toggle_value(&mut self.replace_open, "Replace…");
+                chip(ui, &mut self.replace_open, icon::PENCIL, "Replace");
             });
         });
         if self.replace_open {
+            ui.add_space(2.0);
             ui.horizontal(|ui| {
-                ui.label("Replace");
-                ui.add(egui::TextEdit::singleline(&mut self.replace_text).desired_width(220.0).hint_text("replacement ($1 in regex mode)"));
-                if ui.button("Replace").clicked() {
+                let rt = &mut self.replace_text;
+                field(ui, icon::PENCIL, &mut |ui: &mut Ui| {
+                    ui.add(egui::TextEdit::singleline(rt).frame(egui::Frame::NONE).desired_width(240.0).hint_text("Replace with ($1 in regex mode)"));
+                });
+                if ui_kit::secondary(ui, "Replace").clicked() {
                     action = Some(Cmd::ReplaceNext);
                 }
-                if ui.button("Replace All").clicked() {
+                if ui_kit::secondary(ui, "Replace All").clicked() {
                     action = Some(Cmd::ReplaceAll);
                 }
                 if let Some(re) = self.find.compile().ok().flatten() {
                     if let Some(d) = self.docs.get(self.active) {
                         if d.vrows() > 0 && !d.vcols.is_empty() {
-                            let v = d.cell(d.vrow_to_data(d.grid.cur.0), d.vcol_to_col(d.grid.cur.1));
-                            if re.is_match(&v) {
+                            let cell = d.cell(d.vrow_to_data(d.grid.cur.0), d.vcol_to_col(d.grid.cur.1));
+                            if re.is_match(&cell) {
                                 let preview = if self.find.regex {
-                                    re.replace_all(&v, self.replace_text.as_str()).into_owned()
+                                    re.replace_all(&cell, self.replace_text.as_str()).into_owned()
                                 } else {
-                                    re.replace_all(&v, regex::NoExpand(&self.replace_text)).into_owned()
+                                    re.replace_all(&cell, regex::NoExpand(&self.replace_text)).into_owned()
                                 };
-                                ui.weak(format!("Preview: {v} → {preview}"));
+                                let short = |s: &str| s.chars().take(40).collect::<String>();
+                                ui.weak(format!("{}  →  {}", short(&cell), short(&preview)));
                             }
                         }
                     }
                 }
             });
+        }
+        if ui.input(|i| i.key_pressed(Key::Escape)) && ctx.memory(|m| m.focused()).is_some_and(|f| f != grid::grid_id()) {
+            self.find_open = false;
+            self.replace_open = false;
         }
         if let Some(c) = action {
             self.run(&ctx, c);
@@ -2266,79 +2522,83 @@ impl App {
     }
 
     fn status_bar(&mut self, ui: &mut Ui) {
+        use ui_kit::icon;
         let ctx = ui.ctx().clone();
         let mut open_filters = false;
+        let v = ui.visuals().clone();
+        let accent = v.selection.stroke.color;
+        let small = |t: String| RichText::new(t).size(12.0).color(v.weak_text_color());
         ui.horizontal(|ui| {
-            if let Some(d) = self.docs.get(self.active) {
-                if !d.ready() {
-                    ui.spinner();
-                    ui.label(format!("Indexing {:.0}% — {} rows", d.index_progress() * 100.0, fmt_num(d.total_rows())));
-                } else {
-                    ui.label(format!("{} rows × {} cols", fmt_num(d.nrows()), d.ncols()));
-                }
-                if d.visible.is_some() || d.vcols.len() != d.ncols() {
-                    ui.colored_label(ui.visuals().warn_fg_color, format!("showing {} rows × {} cols", fmt_num(d.vrows()), d.vcols.len()));
-                }
-                let nf = d.filters.len();
-                if ui.button(if nf > 0 { format!("Filters ({nf})") } else { "Filters".into() }).clicked() {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            let Some(d) = self.docs.get(self.active) else {
+                ui.label(small(format!("{APP_NAME} {}", env!("CARGO_PKG_VERSION"))));
+                return;
+            };
+            if !d.ready() {
+                ui.spinner();
+                ui.label(small(format!("Indexing {:.0}% · {} rows", d.index_progress() * 100.0, fmt_num(d.total_rows()))));
+            } else {
+                ui_kit::icon_label(ui, icon::TABLE, small(format!("{} rows · {} columns", fmt_num(d.nrows()), d.ncols())), Some(v.weak_text_color()));
+            }
+            if d.visible.is_some() || !d.filters.is_empty() || d.vcols.len() != d.ncols() {
+                let text = format!("{} of {} rows", fmt_num(d.vrows()), fmt_num(d.nrows()));
+                let b = egui::Button::new((ui_kit::icon_text(icon::FUNNEL, 12.0).color(accent), RichText::new(text).size(12.0).color(accent)))
+                    .fill(accent.gamma_multiply(0.14))
+                    .corner_radius(10);
+                if ui.add(b).on_hover_text("Filters and hidden rows — click to manage").clicked() {
                     open_filters = true;
                 }
-                for j in [&d.view_job, &d.aux_job].into_iter().flatten() {
-                    ui.spinner();
-                    ui.label(format!("{} {:.0}s", j.label, j.started.elapsed().as_secs_f32()));
-                }
-                ui.separator();
-                if d.vrows() > 0 && !d.vcols.is_empty() {
-                    let (r, c) = d.grid.cur;
-                    let dr = d.vrow_to_data(r);
-                    let col = d.vcol_to_col(c);
-                    ui.label(format!(
-                        "{}{}",
-                        if self.settings.col_letters { col_letter(col) } else { (col as i64 + self.settings.first_col_index).to_string() },
-                        dr as i64 + self.settings.first_row_index
-                    ));
-                    let ((r0, c0), (r1, c1)) = d.sel_range();
-                    let cells = (r1 + 1 - r0) * (c1 + 1 - c0);
-                    if cells > 1 && cells <= 20_000 {
-                        let snap = d.snap();
-                        let (mut sum, mut cnt, mut nonempty) = (0.0, 0usize, 0usize);
-                        for vr in r0..=r1.min(d.vrows() - 1) {
-                            let vals = snap.row_values(d.data_row_id(d.vrow_to_data(vr)));
-                            for vc in c0..=c1.min(d.vcols.len() - 1) {
-                                let v = vals.get(d.vcols[vc]).map(|s| s.trim()).unwrap_or("");
-                                if !v.is_empty() {
-                                    nonempty += 1;
-                                }
-                                if let Ok(x) = v.parse::<f64>() {
-                                    sum += x;
-                                    cnt += 1;
-                                }
+            }
+            for j in [&d.view_job, &d.aux_job].into_iter().flatten() {
+                ui.spinner();
+                ui.label(small(format!("{}…", j.label)));
+            }
+            if d.vrows() > 0 && !d.vcols.is_empty() {
+                let (r, c) = d.grid.cur;
+                let dr = d.vrow_to_data(r);
+                let col = d.vcol_to_col(c);
+                let cref = format!(
+                    "{}{}",
+                    if self.settings.col_letters { col_letter(col) } else { format!("{}:", col as i64 + self.settings.first_col_index) },
+                    dr as i64 + self.settings.first_row_index
+                );
+                ui.label(RichText::new(cref).size(12.0).font(ui_kit::semibold(12.0)));
+                let ((r0, c0), (r1, c1)) = d.sel_range();
+                let cells = (r1 + 1 - r0) * (c1 + 1 - c0);
+                if cells > 1 && cells <= 20_000 {
+                    let snap = d.snap();
+                    let (mut sum, mut cnt, mut nonempty) = (0.0, 0usize, 0usize);
+                    for vr in r0..=r1.min(d.vrows() - 1) {
+                        let vals = snap.row_values(d.data_row_id(d.vrow_to_data(vr)));
+                        for vc in c0..=c1.min(d.vcols.len() - 1) {
+                            let s = vals.get(d.vcols[vc]).map(|s| s.trim()).unwrap_or("");
+                            if !s.is_empty() {
+                                nonempty += 1;
+                            }
+                            if let Ok(x) = s.parse::<f64>() {
+                                sum += x;
+                                cnt += 1;
                             }
                         }
-                        ui.weak(format!("{cells} cells · count {nonempty}"));
-                        if cnt > 0 {
-                            ui.weak(format!("sum {} · avg {}", trim_f(sum), trim_f(sum / cnt as f64)));
-                        }
-                    } else if cells > 1 {
-                        ui.weak(format!("{} cells", fmt_num(cells)));
                     }
+                    let mut t = format!("{} cells · {} filled", fmt_num(cells), fmt_num(nonempty));
+                    if cnt > 0 {
+                        t.push_str(&format!(" · sum {} · avg {}", trim_f(sum), trim_f(sum / cnt as f64)));
+                    }
+                    ui.label(small(t));
+                } else if cells > 1 {
+                    ui.label(small(format!("{} cells", fmt_num(cells))));
                 }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.weak(format!(
-                        "{} · {} · {}",
-                        delimiter_label(d.src.delimiter),
-                        d.src.encoding.name(),
-                        d.src.line_ending.label()
-                    ));
-                    if let Some((m, t)) = &self.status {
-                        if t.elapsed() < Duration::from_secs(8) {
-                            ui.label(RichText::new(m).color(ui.visuals().hyperlink_color));
-                        }
-                    }
-                });
-            } else if let Some((m, _)) = &self.status {
-                ui.label(m);
             }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                for t in [d.src.line_ending.label().to_string(), d.src.encoding.name().to_string(), delimiter_label(d.src.delimiter)] {
+                    ui_kit::kbd(ui, &t);
+                }
+                if d.read_only {
+                    ui_kit::icon_label(ui, icon::LOCK, RichText::new("Read-only").size(12.0), Some(v.warn_fg_color));
+                }
+            });
         });
         if open_filters {
             self.run(&ctx, Cmd::ViewFilters);
@@ -2395,8 +2655,9 @@ impl App {
     }
 
     fn palette_ui(&mut self, ctx: &Context) {
+        use ui_kit::icon;
         let Some(p) = &mut self.palette else { return };
-        let mut items: Vec<(i32, String, String, PalItem)> = Vec::new();
+        let mut items: Vec<(i32, String, String, String, PalItem)> = Vec::new(); // score, title, subtitle, shortcut, item
         if p.files {
             let mut seen = HashSet::new();
             let paths = self
@@ -2412,38 +2673,56 @@ impl App {
                 let s = path.display().to_string();
                 if let Some(sc) = commands::fuzzy_score(&p.query, &s) {
                     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                    items.push((sc, name, s, PalItem::File(path)));
+                    let dir = path.parent().map(|d| d.display().to_string()).unwrap_or_default();
+                    items.push((sc, name, dir, String::new(), PalItem::File(path)));
                 }
             }
         } else {
             for &c in commands::ALL {
-                let label = format!("{}: {}", c.category(), c.name());
+                let label = format!("{} {}", c.category(), c.name());
                 if let Some(sc) = commands::fuzzy_score(&p.query, &label) {
-                    items.push((sc, label, commands::shortcut_text(ctx, c), PalItem::Cmd(c)));
+                    items.push((sc, c.name().into(), c.category().into(), commands::shortcut_text(ctx, c), PalItem::Cmd(c)));
                 }
             }
             for (i, t) in self.transforms.iter().enumerate() {
-                let label = format!("Transform: {}", t.name);
+                let label = format!("Transform {}", t.name);
                 if let Some(sc) = commands::fuzzy_score(&p.query, &label) {
-                    items.push((sc, label, String::new(), PalItem::Transform(i)));
+                    items.push((sc, t.name.into(), "Transform".into(), String::new(), PalItem::Transform(i)));
                 }
             }
         }
         items.sort_by(|a, b| b.0.cmp(&a.0));
         items.truncate(200);
+        p.sel = p.sel.min(items.len().saturating_sub(1));
         let mut chosen = None;
-        let mut close = false;
-        egui::Modal::new(egui::Id::new("palette")).show(ctx, |ui| {
-            ui.set_width(560.0);
-            let hint = if p.files { "Go to file…" } else { "Type a command…" };
-            let r = ui.add(egui::TextEdit::singleline(&mut p.query).hint_text(hint).desired_width(f32::INFINITY));
-            if p.focus {
-                r.request_focus();
-                p.focus = false;
-            }
-            if r.changed() {
-                p.sel = 0;
-            }
+        let v = ctx.global_style().visuals.clone();
+        let accent = v.selection.stroke.color;
+        let frame = egui::Frame::new()
+            .fill(v.window_fill)
+            .stroke(v.window_stroke)
+            .shadow(v.window_shadow)
+            .corner_radius(14)
+            .inner_margin(egui::Margin::same(10));
+        let area = egui::Modal::default_area(egui::Id::new("palette-area")).anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 90.0));
+        let resp = egui::Modal::new(egui::Id::new("palette")).area(area).frame(frame).backdrop_color(Color32::from_black_alpha(70)).show(ctx, |ui| {
+            ui.set_width(620.0);
+            ui.horizontal(|ui| {
+                ui.add_space(6.0);
+                ui.label(ui_kit::icon_text(icon::SEARCH, 18.0).color(v.weak_text_color()));
+                let hint = if p.files { "Go to file…" } else { "Search commands and transforms…" };
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut p.query).frame(egui::Frame::NONE).hint_text(hint).font(egui::FontId::proportional(17.0)).desired_width(f32::INFINITY),
+                );
+                if p.focus {
+                    r.request_focus();
+                    p.focus = false;
+                }
+                if r.changed() {
+                    p.sel = 0;
+                }
+            });
+            ui.add_space(6.0);
+            ui.separator();
             ui.input(|i| {
                 if i.key_pressed(Key::ArrowDown) {
                     p.sel = (p.sel + 1).min(items.len().saturating_sub(1));
@@ -2451,33 +2730,56 @@ impl App {
                 if i.key_pressed(Key::ArrowUp) {
                     p.sel = p.sel.saturating_sub(1);
                 }
-                if i.key_pressed(Key::Escape) {
-                    close = true;
-                }
                 if i.key_pressed(Key::Enter) {
-                    chosen = items.get(p.sel).map(|x| x.3.clone());
+                    chosen = items.get(p.sel).map(|x| x.4.clone());
                 }
             });
-            egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
-                for (k, (_, label, extra, item)) in items.iter().enumerate() {
+            egui::ScrollArea::vertical().max_height(380.0).show(ui, |ui| {
+                if items.is_empty() {
+                    ui.add_space(12.0);
+                    ui.vertical_centered(|ui| ui.weak("No matches"));
+                    ui.add_space(12.0);
+                }
+                for (k, (_, title, sub, shortcut, item)) in items.iter().enumerate() {
                     let sel = k == p.sel;
-                    let r = ui
-                        .horizontal(|ui| {
-                            let r = ui.selectable_label(sel, label);
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.weak(extra));
-                            r
-                        })
-                        .inner;
+                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 34.0), egui::Sense::click());
                     if sel {
-                        r.scroll_to_me(None);
+                        ui.painter().rect_filled(rect, 8, accent.gamma_multiply(0.18));
+                        resp.scroll_to_me(None);
+                    } else if resp.hovered() {
+                        ui.painter().rect_filled(rect, 8, v.widgets.hovered.weak_bg_fill);
                     }
-                    if r.clicked() {
+                    let ic = match item {
+                        PalItem::File(_) => icon::FILE_TEXT,
+                        PalItem::Transform(_) => icon::MAGIC,
+                        PalItem::Cmd(_) => icon::COMMAND,
+                    };
+                    let pnt = ui.painter();
+                    let fg = if sel { accent } else { v.weak_text_color() };
+                    pnt.text(egui::pos2(rect.left() + 14.0, rect.center().y), egui::Align2::LEFT_CENTER, ic, ui_kit::icon_font(15.0), fg);
+                    let title_g = pnt.text(egui::pos2(rect.left() + 40.0, rect.center().y), egui::Align2::LEFT_CENTER, title, egui::FontId::proportional(14.0), v.text_color());
+                    pnt.with_clip_rect(rect.shrink(4.0)).text(
+                        egui::pos2(title_g.right() + 10.0, rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        sub,
+                        egui::FontId::proportional(12.0),
+                        v.weak_text_color(),
+                    );
+                    if !shortcut.is_empty() {
+                        pnt.text(egui::pos2(rect.right() - 12.0, rect.center().y), egui::Align2::RIGHT_CENTER, shortcut, egui::FontId::proportional(12.0), v.weak_text_color());
+                    }
+                    if resp.clicked() {
                         chosen = Some(item.clone());
                     }
                 }
             });
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.add_space(6.0);
+                ui.label(RichText::new("↑↓ navigate    ↵ run    esc close").size(11.5).color(v.weak_text_color()));
+            });
         });
-        if close || chosen.is_some() {
+        if resp.should_close() || chosen.is_some() {
             self.palette = None;
         }
         if let Some(item) = chosen {
@@ -2487,519 +2789,673 @@ impl App {
 
     fn prompt_ui(&mut self, ctx: &Context) {
         let Some(p) = &mut self.prompt else { return };
-        let mut submit = false;
-        let mut cancel = false;
-        egui::Modal::new(egui::Id::new("prompt")).show(ctx, |ui| {
-            ui.set_min_width(380.0);
-            ui.heading(&p.title);
-            ui.add_space(6.0);
-            egui::Grid::new("prompt_grid").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                for (k, prm) in p.params.iter().enumerate() {
-                    ui.label(prm.label);
-                    let v = p.values.entry(prm.key.to_string()).or_insert_with(|| prm.default.to_string());
-                    match &prm.kind {
-                        ParamKind::Bool => {
-                            let mut b = matches!(v.as_str(), "true" | "1" | "yes");
-                            if ui.checkbox(&mut b, "").changed() {
-                                *v = b.to_string();
-                            }
-                        }
-                        ParamKind::Choice(opts) => {
-                            egui::ComboBox::from_id_salt(("choice", k)).selected_text(v.clone()).show_ui(ui, |ui| {
-                                for o in opts {
-                                    ui.selectable_value(v, o.to_string(), *o);
+        let is_transform = matches!(p.action, PromptAction::Transform(_));
+        let ic = if is_transform { ui_kit::icon::MAGIC } else { ui_kit::icon::PENCIL };
+        let accent = ctx.global_style().visuals.selection.stroke.color;
+        let title = p.title.clone();
+        let res = ui_kit::Dialog::new("prompt", title).icon(ic, accent).width(400.0).show(
+            ctx,
+            |ui| {
+                let mut submit = false;
+                egui::Grid::new("prompt_grid").num_columns(2).spacing([14.0, 10.0]).min_col_width(110.0).show(ui, |ui| {
+                    for (k, prm) in p.params.iter().enumerate() {
+                        ui.label(RichText::new(prm.label).color(ui.visuals().weak_text_color()));
+                        let v = p.values.entry(prm.key.to_string()).or_insert_with(|| prm.default.to_string());
+                        match &prm.kind {
+                            ParamKind::Bool => {
+                                let mut b = matches!(v.as_str(), "true" | "1" | "yes");
+                                if ui.checkbox(&mut b, "").changed() {
+                                    *v = b.to_string();
                                 }
-                            });
-                        }
-                        _ => {
-                            let r = ui.text_edit_singleline(v);
-                            if k == 0 && p.focus {
-                                r.request_focus();
                             }
-                            if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                                submit = true;
+                            ParamKind::Choice(opts) => {
+                                egui::ComboBox::from_id_salt(("choice", k)).width(220.0).selected_text(v.clone()).show_ui(ui, |ui| {
+                                    for o in opts {
+                                        ui.selectable_value(v, o.to_string(), *o);
+                                    }
+                                });
+                            }
+                            _ => {
+                                let r = ui.add(egui::TextEdit::singleline(v).desired_width(220.0));
+                                if k == 0 && p.focus {
+                                    r.request_focus();
+                                }
+                                if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                                    submit = true;
+                                }
                             }
                         }
-                    }
-                    ui.end_row();
-                    if !prm.help.is_empty() {
-                        ui.label("");
-                        ui.weak(prm.help);
                         ui.end_row();
+                        if !prm.help.is_empty() {
+                            ui.label("");
+                            ui.label(RichText::new(prm.help).size(11.5).color(ui.visuals().weak_text_color()));
+                            ui.end_row();
+                        }
                     }
+                });
+                p.focus = false;
+                (submit, false)
+            },
+            |ui, (submit, cancel)| {
+                if ui_kit::primary(ui, if is_transform { "Apply" } else { "OK" }).clicked() {
+                    *submit = true;
                 }
-            });
-            p.focus = false;
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.button("OK").clicked() {
-                    submit = true;
+                if ui_kit::secondary(ui, "Cancel").clicked() {
+                    *cancel = true;
                 }
-                if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
-                    cancel = true;
-                }
-            });
-        });
+            },
+        );
+        let (submit, cancel) = res.inner;
         if submit {
             let p = self.prompt.take().unwrap();
             self.submit_prompt(ctx, p);
-        } else if cancel {
+        } else if cancel || res.dismissed {
             self.prompt = None;
         }
     }
 
     fn dialogs(&mut self, ctx: &Context) {
+        use ui_kit::{danger, icon, primary, secondary, section, Dialog as Dlg};
         let Some(mut dlg) = self.dialog.take() else { return };
         let mut keep = true;
         let mut after: Option<Box<dyn FnOnce(&mut App, &Context)>> = None;
+        let vis = ctx.global_style().visuals.clone();
+        let accent = vis.selection.stroke.color;
+        let warn = vis.warn_fg_color;
+        let weak = vis.weak_text_color();
+        let error = vis.error_fg_color;
         match &mut dlg {
             Dialog::ConfirmClose { tabs, quit } => {
-                egui::Modal::new(egui::Id::new("confirm")).show(ctx, |ui| {
-                    ui.heading("Unsaved changes");
-                    for &i in tabs.iter() {
-                        if let Some(d) = self.docs.get(i).filter(|d| d.dirty) {
-                            ui.label(format!("• {}", d.title()));
+                let dirty: Vec<String> = tabs.iter().filter_map(|&i| self.docs.get(i).filter(|d| d.dirty).map(|d| d.title())).collect();
+                let title = match dirty.as_slice() {
+                    [one] => format!("Save changes to “{one}”?"),
+                    many => format!("Save changes to {} files?", many.len()),
+                };
+                let r = Dlg::new("confirm", title).icon(icon::WARNING, warn).show(
+                    ctx,
+                    |ui| {
+                        if dirty.len() > 1 {
+                            for n in &dirty {
+                                ui.label(format!("•  {n}"));
+                            }
+                            ui.add_space(4.0);
                         }
-                    }
-                    ui.label("Close without saving?");
-                    ui.horizontal(|ui| {
-                        if ui.button("Discard changes").clicked() {
-                            let (tabs, quit) = (tabs.clone(), *quit);
-                            after = Some(Box::new(move |app, ctx| {
-                                for &i in &tabs {
-                                    if let Some(d) = app.docs.get_mut(i) {
-                                        d.dirty = false;
-                                    }
-                                }
-                                if quit {
-                                    app.allow_quit = true;
-                                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                                } else {
-                                    app.close_tabs(tabs);
-                                }
-                            }));
-                            keep = false;
+                        ui.label(RichText::new("Your changes will be lost if you don't save them.").color(weak));
+                        0u8
+                    },
+                    |ui, choice| {
+                        if primary(ui, "Save").clicked() {
+                            *choice = 1;
                         }
-                        if ui.button("Cancel").clicked() {
-                            keep = false;
+                        if secondary(ui, "Cancel").clicked() {
+                            *choice = 3;
                         }
-                    });
-                });
-            }
-            Dialog::Filters { col, text, focus } => {
-                let Some(d) = self.docs.get_mut(self.active) else { return };
-                let names: Vec<String> = (0..d.ncols()).map(|c| d.snap().column_name(c)).collect();
-                egui::Window::new("Filters").collapsible(false).resizable(true).default_width(460.0).show(ctx, |ui| {
-                    ui.label("Rows are kept when every filter matches.");
-                    let mut remove = None;
-                    for (k, f) in d.filters.iter().enumerate() {
-                        ui.horizontal(|ui| {
-                            let cname = f
-                                .col
-                                .and_then(|id| d.cols.iter().position(|&x| x == id))
-                                .map_or("(any column)".to_string(), |c| names[c].clone());
-                            ui.label(format!("{cname}:"));
-                            ui.code(&f.text);
-                            if ui.small_button("Remove").clicked() {
-                                remove = Some(k);
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            if danger(ui, "Don't Save").clicked() {
+                                *choice = 2;
                             }
                         });
-                    }
-                    if let Some(k) = remove {
-                        d.filters.remove(k);
-                        d.view_dirty = true;
-                    }
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        egui::ComboBox::from_id_salt("fcol")
-                            .selected_text(col.map_or("(any column)".to_string(), |c| names.get(c).cloned().unwrap_or_default()))
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(col, None, "(any column)");
-                                for (c, n) in names.iter().enumerate() {
-                                    ui.selectable_value(col, Some(c), n);
-                                }
-                            });
-                        let r = ui.add(egui::TextEdit::singleline(text).hint_text("e.g. >100 | =done | !draft | #^\\d+$"));
-                        if *focus {
-                            r.request_focus();
-                            *focus = false;
+                        if ui.input(|i| i.key_pressed(Key::Enter)) {
+                            *choice = 1;
                         }
-                        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-                        if (ui.button("Add").clicked() || enter) && !text.trim().is_empty() {
-                            match Query::parse(text) {
-                                Ok(_) => {
-                                    d.filters.push(Filter { col: col.map(|c| d.cols[c]), text: text.clone() });
-                                    d.view_dirty = true;
-                                    text.clear();
-                                }
-                                Err(e) => {
-                                    after = Some(Box::new(move |app, _| app.msg(e)));
+                    },
+                );
+                let (tabs, quit) = (tabs.clone(), *quit);
+                match r.inner {
+                    1 => {
+                        after = Some(Box::new(move |app, ctx| app.save_and_close(ctx, tabs, quit)));
+                        keep = false;
+                    }
+                    2 => {
+                        after = Some(Box::new(move |app, ctx| {
+                            for &i in &tabs {
+                                if let Some(d) = app.docs.get_mut(i) {
+                                    d.dirty = false;
                                 }
                             }
-                        }
-                    });
-                    ui.collapsing("Syntax", |ui| {
-                        ui.label("foo — contains   =foo — equals   f*o — wildcard   !foo — not");
-                        ui.label("a | b — or   a & b — and   >5  <=10  50+  50-  10-20 — numbers");
-                        ui.label("! — not empty   #regex — regular expression (whole query)");
-                    });
-                    ui.horizontal(|ui| {
-                        if ui.button("Remove All").clicked() {
-                            d.filters.clear();
-                            d.view_dirty = true;
-                        }
-                        if ui.button("Close").clicked() {
-                            keep = false;
-                        }
-                    });
-                });
-            }
-            Dialog::Preferences => {
-                let mut open = true;
-                let s = &mut self.settings;
-                egui::Window::new("Preferences").open(&mut open).default_width(440.0).show(ctx, |ui| {
-                    egui::Grid::new("prefs").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
-                        ui.label("Theme");
-                        egui::ComboBox::from_id_salt("theme").selected_text(s.theme.label()).show_ui(ui, |ui| {
-                            for t in Theme::ALL {
-                                ui.selectable_value(&mut s.theme, t, t.label());
+                            if quit {
+                                app.allow_quit = true;
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            } else {
+                                app.close_tabs(tabs);
                             }
-                        });
-                        ui.end_row();
-                        ui.label("Text size");
-                        ui.add(egui::Slider::new(&mut s.font_size, 9.0..=24.0));
-                        ui.end_row();
-                        ui.label("Row height");
-                        ui.add(egui::Slider::new(&mut s.row_height, 16.0..=48.0));
-                        ui.end_row();
-                        ui.label("Max auto-fit width");
-                        ui.add(egui::Slider::new(&mut s.max_autofit_width, 100.0..=1200.0));
-                        ui.end_row();
-                        ui.label("Table");
-                        ui.vertical(|ui| {
-                            ui.checkbox(&mut s.shade_rows, "Shade every other row");
-                            ui.checkbox(&mut s.shade_cols, "Shade every other column");
-                            ui.checkbox(&mut s.highlight_cursor_cross, "Highlight selected cell's row and column");
-                            ui.checkbox(&mut s.show_row_labels, "Show row labels");
-                            ui.checkbox(&mut s.show_col_labels, "Show column labels");
-                            ui.checkbox(&mut s.col_letters, "Represent columns as letters");
-                        });
-                        ui.end_row();
-                        ui.label("First row index");
-                        ui.add(egui::DragValue::new(&mut s.first_row_index));
-                        ui.end_row();
-                        ui.label("First column index");
-                        ui.add(egui::DragValue::new(&mut s.first_col_index));
-                        ui.end_row();
-                        ui.label("Files");
-                        ui.vertical(|ui| {
-                            ui.checkbox(&mut s.default_header, "First row is a header (new files)");
-                            ui.checkbox(&mut s.auto_detect_delimiter, "Auto-detect delimiter");
-                            ui.checkbox(&mut s.retain_filters_on_refresh, "Retain filters on file refresh");
-                            ui.checkbox(&mut s.save_after_each_edit, "Save after each edit");
-                        });
-                        ui.end_row();
-                        ui.label("Open read-only above (MB, 0 = never)");
-                        ui.add(egui::DragValue::new(&mut s.read_only_threshold_mb));
-                        ui.end_row();
-                        ui.label("When file changes on disk");
-                        egui::ComboBox::from_id_salt("ext").selected_text(format!("{:?}", s.external_change)).show_ui(ui, |ui| {
-                            ui.selectable_value(&mut s.external_change, ExternalChange::Refresh, "Refresh");
-                            ui.selectable_value(&mut s.external_change, ExternalChange::Ask, "Ask");
-                            ui.selectable_value(&mut s.external_change, ExternalChange::Ignore, "Ignore");
-                        });
-                        ui.end_row();
-                        ui.label("Search engine URL");
-                        ui.text_edit_singleline(&mut s.search_engine);
-                        ui.end_row();
-                        ui.label("Map search URL");
-                        ui.text_edit_singleline(&mut s.map_engine);
-                        ui.end_row();
-                        ui.label("Text editor command");
-                        ui.add(egui::TextEdit::singleline(&mut s.text_editor).hint_text("system default"));
-                        ui.end_row();
-                        ui.label("Dhivehi font (Faruma)");
-                        ui.horizontal(|ui| {
-                            let found = crate::rtl::find_faruma(&s.dhivehi_font);
-                            let hint = found.as_ref().map_or("not found — browse to Faruma".to_string(), |p| format!("auto: {}", p.display()));
-                            ui.add(egui::TextEdit::singleline(&mut s.dhivehi_font).hint_text(hint).desired_width(220.0));
-                            if ui.button("Browse…").clicked() {
-                                if let Some(p) = rfd::FileDialog::new().add_filter("Font", &["ttf", "otf"]).pick_file() {
-                                    s.dhivehi_font = p.to_string_lossy().into_owned();
-                                }
-                            }
-                            if ui.button("Apply").clicked() {
-                                let w = crate::rtl::install_fonts(ctx, &s.dhivehi_font);
-                                after = Some(Box::new(move |app, _| app.msg(w.unwrap_or_else(|| "Fonts reloaded".into()))));
-                            }
-                        });
-                        ui.end_row();
-                    });
-                    ui.separator();
-                    ui.strong("File extension options (extension → delimiter)");
-                    let mut remove = None;
-                    for (ext, del) in s.ext_delimiters.iter_mut() {
-                        ui.horizontal(|ui| {
-                            ui.label(format!(".{ext}"));
-                            ui.add(egui::TextEdit::singleline(del).desired_width(40.0));
-                            if ui.small_button("×").clicked() {
-                                remove = Some(ext.clone());
-                            }
-                        });
+                        }));
+                        keep = false;
                     }
-                    if let Some(e) = remove {
-                        s.ext_delimiters.remove(&e);
-                    }
-                    if ui.button("+ Add extension").clicked() {
-                        s.ext_delimiters.insert(format!("ext{}", s.ext_delimiters.len() + 1), ";".into());
-                    }
-                    ui.weak("Use \\t for tab. Applies to newly opened files.");
-                    if let Some(dir) = config_dir() {
-                        ui.weak(format!("Settings file: {}", dir.join("settings.json").display()));
-                    }
-                });
-                if !open {
-                    keep = false;
-                    self.settings.save();
-                }
-            }
-            Dialog::Lookup(st) => {
-                let mut open = true;
-                let doc_names: Vec<String> = self.docs.iter().map(|d| d.title()).collect();
-                if st.src_doc >= self.docs.len() || self.docs.is_empty() {
-                    return;
-                }
-                let src_names: Vec<String> = { let s = self.docs[st.src_doc].snap(); (0..s.ncols()).map(|c| s.column_name(c)).collect() };
-                let dst = &self.docs[self.active];
-                let dst_names: Vec<String> = { let s = dst.snap(); (0..s.ncols()).map(|c| s.column_name(c)).collect() };
-                let mut run = false;
-                egui::Window::new("Column Lookup").open(&mut open).default_width(480.0).show(ctx, |ui| {
-                    ui.label("Copy values from a lookup file into this file by matching key columns (like VLOOKUP).");
-                    ui.separator();
-                    egui::Grid::new("lk").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-                        ui.label("1. Look up data from");
-                        let before = st.src_doc;
-                        egui::ComboBox::from_id_salt("lsrc").selected_text(&doc_names[st.src_doc]).show_ui(ui, |ui| {
-                            for (i, n) in doc_names.iter().enumerate() {
-                                ui.selectable_value(&mut st.src_doc, i, n);
-                            }
-                        });
-                        if before != st.src_doc {
-                            st.src_vals = vec![false; self.docs[st.src_doc].ncols()];
-                            st.src_key = 0;
-                        }
-                        ui.end_row();
-                        ui.label("2. Key column in lookup file");
-                        egui::ComboBox::from_id_salt("lkey").selected_text(src_names.get(st.src_key).cloned().unwrap_or_default()).show_ui(ui, |ui| {
-                            for (c, n) in src_names.iter().enumerate() {
-                                ui.selectable_value(&mut st.src_key, c, n);
-                            }
-                        });
-                        ui.end_row();
-                        ui.label("3. Value column(s)");
-                        egui::ScrollArea::vertical().max_height(140.0).id_salt("lvals").show(ui, |ui| {
-                            st.src_vals.resize(src_names.len(), false);
-                            for (c, n) in src_names.iter().enumerate() {
-                                if c != st.src_key {
-                                    ui.checkbox(&mut st.src_vals[c], n);
-                                }
-                            }
-                        });
-                        ui.end_row();
-                        ui.label("4. Write to");
-                        ui.label(dst.title());
-                        ui.end_row();
-                        ui.label("5. Key column here");
-                        egui::ComboBox::from_id_salt("ldk").selected_text(dst_names.get(st.dst_key).cloned().unwrap_or_default()).show_ui(ui, |ui| {
-                            for (c, n) in dst_names.iter().enumerate() {
-                                ui.selectable_value(&mut st.dst_key, c, n);
-                            }
-                        });
-                        ui.end_row();
-                        ui.label("6. Output");
-                        ui.vertical(|ui| {
-                            ui.radio_value(&mut st.insert, true, "Insert new columns after the key column");
-                            ui.radio_value(&mut st.insert, false, "Overwrite existing columns starting at:");
-                            if !st.insert {
-                                egui::ComboBox::from_id_salt("lds").selected_text(dst_names.get(st.dst_start).cloned().unwrap_or("(new)".into())).show_ui(ui, |ui| {
-                                    for (c, n) in dst_names.iter().enumerate() {
-                                        ui.selectable_value(&mut st.dst_start, c, n);
-                                    }
-                                });
-                            }
-                        });
-                        ui.end_row();
-                    });
-                    if ui.button("Run Lookup").clicked() {
-                        run = true;
-                    }
-                });
-                if run {
-                    let st2 = LookupState { src_vals: st.src_vals.clone(), ..*st };
-                    after = Some(Box::new(move |app, _| app.run_lookup(&st2)));
-                    keep = false;
-                }
-                if !open {
-                    keep = false;
-                }
-            }
-            Dialog::Pdf { opts, selection_only, print, title } => {
-                let mut open = true;
-                let mut go = false;
-                egui::Window::new(if *print { "Print" } else { "Export to PDF" }).open(&mut open).show(ctx, |ui| {
-                    egui::Grid::new("pdf").num_columns(2).show(ui, |ui| {
-                        ui.label("Page Setup");
-                        ui.vertical(|ui| {
-                            ui.horizontal(|ui| {
-                                ui.radio_value(&mut opts.paper_a4, false, "Letter");
-                                ui.radio_value(&mut opts.paper_a4, true, "A4");
-                            });
-                            ui.horizontal(|ui| {
-                                ui.radio_value(&mut opts.landscape, false, "Portrait");
-                                ui.radio_value(&mut opts.landscape, true, "Landscape");
-                            });
-                            ui.add(egui::Slider::new(&mut opts.font_size, 5.0..=16.0).text("font size"));
-                        });
-                        ui.end_row();
-                        ui.label("Print Range");
-                        ui.checkbox(selection_only, "Selection only");
-                        ui.end_row();
-                        ui.label("CSV Options");
-                        ui.vertical(|ui| {
-                            ui.checkbox(&mut opts.repeat_headers, "Headers on every page");
-                            ui.checkbox(&mut opts.labels, "Row/column labels");
-                            ui.checkbox(&mut opts.gridlines, "Gridlines");
-                            ui.checkbox(&mut opts.center_horizontally, "Center horizontally");
-                            ui.checkbox(&mut opts.center_vertically, "Center vertically");
-                            ui.horizontal(|ui| {
-                                ui.label("Page order");
-                                ui.radio_value(&mut opts.row_wise_page_order, true, "Row-wise");
-                                ui.radio_value(&mut opts.row_wise_page_order, false, "Column-wise");
-                            });
-                            ui.checkbox(title, "Title at top");
-                            ui.checkbox(&mut opts.page_numbers, "Page numbers");
-                        });
-                        ui.end_row();
-                    });
-                    if ui.button(if *print { "Print…" } else { "Export…" }).clicked() {
-                        go = true;
-                    }
-                });
-                if go {
-                    let mut o = opts.clone();
-                    let (sel, is_print, want_title) = (*selection_only, *print, *title);
-                    after = Some(Box::new(move |app, ctx| app.export_pdf(ctx, &mut o, sel, is_print, want_title)));
-                    keep = false;
-                }
-                if !open {
-                    keep = false;
-                }
-            }
-            Dialog::Export { format, typed, visible_only } => {
-                let mut open = true;
-                let mut go = false;
-                egui::Window::new("Export To JSON or XML").open(&mut open).show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.radio_value(format, ExportFormat::Json, "JSON");
-                        ui.radio_value(format, ExportFormat::Xml, "XML");
-                    });
-                    ui.checkbox(typed, "Typed values (numbers, booleans, null) — JSON only");
-                    ui.checkbox(visible_only, "Visible data only");
-                    ui.weak("Tables imported with \"Preserve Original File Structure\" export back to their original shape.");
-                    if ui.button("Export…").clicked() {
-                        go = true;
-                    }
-                });
-                if go {
-                    let (f, t, v) = (*format, *typed, *visible_only);
-                    after = Some(Box::new(move |app, ctx| app.export_data(ctx, f, t, v)));
-                    keep = false;
-                }
-                if !open {
-                    keep = false;
-                }
-            }
-            Dialog::Import { path, preserve } => {
-                let mut open = true;
-                let mut go = false;
-                egui::Window::new("Import From JSON or XML").open(&mut open).show(ctx, |ui| {
-                    ui.label(path.display().to_string());
-                    ui.checkbox(preserve, "Preserve Original File Structure (lossless, path/value rows)");
-                    if ui.button("Import").clicked() {
-                        go = true;
-                    }
-                });
-                if go {
-                    match formats::import_file(path, *preserve) {
-                        Ok(t) => {
-                            let mut d = Document::from_table(t.header, t.rows);
-                            d.mtime = None;
-                            self.docs.push(d);
-                            self.active = self.docs.len() - 1;
-                            self.msg("Imported — use Save File As to write it as CSV");
-                        }
-                        Err(e) => self.msg(format!("Import failed: {e}")),
-                    }
-                    keep = false;
-                }
-                if !open {
-                    keep = false;
+                    3 => keep = false,
+                    _ => keep = !r.dismissed,
                 }
             }
             Dialog::DeleteFile(i) => {
                 let i = *i;
-                egui::Modal::new(egui::Id::new("del")).show(ctx, |ui| {
-                    let name = self.docs.get(i).map(|d| d.title()).unwrap_or_default();
-                    ui.heading(format!("Delete {name}?"));
-                    ui.label("The file will be permanently deleted from disk.");
-                    ui.horizontal(|ui| {
-                        if ui.button("Delete").clicked() {
-                            if i < self.docs.len() {
-                                let d = self.docs.remove(i);
-                                let p = d.path.clone();
-                                drop(d);
-                                if let Some(p) = p {
-                                    match std::fs::remove_file(&p) {
-                                        Ok(()) => self.msg(format!("Deleted {}", p.display())),
-                                        Err(e) => self.msg(format!("Delete failed: {e}")),
-                                    }
+                let name = self.docs.get(i).map(|d| d.title()).unwrap_or_default();
+                let r = Dlg::new("delete", format!("Delete “{name}”?")).icon(icon::TRASH, error).show(
+                    ctx,
+                    |ui| {
+                        ui.label(RichText::new("The file will be permanently deleted from disk. This can't be undone.").color(weak));
+                        0u8
+                    },
+                    |ui, c| {
+                        if danger(ui, "Delete").clicked() {
+                            *c = 1;
+                        }
+                        if secondary(ui, "Cancel").clicked() {
+                            *c = 2;
+                        }
+                    },
+                );
+                if r.inner == 1 {
+                    after = Some(Box::new(move |app, _| {
+                        if i < app.docs.len() {
+                            let d = app.docs.remove(i);
+                            let p = d.path.clone();
+                            drop(d);
+                            if let Some(p) = p {
+                                match std::fs::remove_file(&p) {
+                                    Ok(()) => app.msg(format!("Deleted {}", p.display())),
+                                    Err(e) => app.msg(format!("Delete failed: {e}")),
                                 }
-                                self.active = self.active.min(self.docs.len().saturating_sub(1));
                             }
-                            keep = false;
+                            app.active = app.active.min(app.docs.len().saturating_sub(1));
                         }
-                        if ui.button("Cancel").clicked() {
-                            keep = false;
-                        }
-                    });
-                });
+                    }));
+                }
+                keep = r.inner == 0 && !r.dismissed;
             }
             Dialog::ExternalChanged(i) => {
                 let i = *i;
-                egui::Modal::new(egui::Id::new("ext")).show(ctx, |ui| {
-                    let name = self.docs.get(i).map(|d| d.title()).unwrap_or_default();
-                    ui.heading(format!("{name} changed on disk"));
-                    ui.horizontal(|ui| {
-                        if ui.button("Reload (discard my changes)").clicked() {
-                            after = Some(Box::new(move |app, ctx| app.reload(ctx, i, None)));
-                            keep = false;
+                let name = self.docs.get(i).map(|d| d.title()).unwrap_or_default();
+                let r = Dlg::new("ext", format!("“{name}” changed on disk")).icon(icon::RELOAD, accent).show(
+                    ctx,
+                    |ui| {
+                        ui.label(RichText::new("Another program modified this file. Reload to see the latest version — unsaved changes in FI CSV will be lost.").color(weak));
+                        0u8
+                    },
+                    |ui, c| {
+                        if primary(ui, "Reload").clicked() {
+                            *c = 1;
                         }
-                        if ui.button("Ignore").clicked() {
-                            keep = false;
+                        if secondary(ui, "Keep My Version").clicked() {
+                            *c = 2;
                         }
-                    });
-                });
+                    },
+                );
+                if r.inner == 1 {
+                    after = Some(Box::new(move |app, ctx| app.reload(ctx, i, None)));
+                }
+                keep = r.inner == 0 && !r.dismissed;
             }
             Dialog::About => {
+                let logo = self.logo(ctx);
+                let r = Dlg::new("about", "").width(340.0).show(
+                    ctx,
+                    |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.add(egui::Image::new(&logo).fit_to_exact_size(egui::vec2(72.0, 72.0)));
+                            ui.add_space(6.0);
+                            ui.label(RichText::new(APP_NAME).font(ui_kit::semibold(22.0)));
+                            ui.label(RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION"))).color(weak));
+                            ui.add_space(8.0);
+                            ui.label("A fast CSV editor for very large files, with full right-to-left and Dhivehi support.");
+                            ui.add_space(4.0);
+                            ui.hyperlink_to("github.com/marcoazeem/ficsv", "https://github.com/marcoazeem/ficsv");
+                        });
+                        false
+                    },
+                    |ui, ok| {
+                        if primary(ui, "OK").clicked() {
+                            *ok = true;
+                        }
+                    },
+                );
+                keep = !r.inner && !r.dismissed;
+            }
+            Dialog::Import { path, preserve } => {
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let r = Dlg::new("import", format!("Import “{name}”")).icon(icon::FILE_TEXT, accent).show(
+                    ctx,
+                    |ui| {
+                        ui.label(RichText::new("FI CSV finds the repeating records in the file and turns them into rows.").color(weak));
+                        ui.add_space(8.0);
+                        ui.checkbox(preserve, "Preserve original file structure");
+                        ui.label(RichText::new("Lossless path/value rows that export back to exactly the same JSON or XML.").size(11.5).color(weak));
+                        0u8
+                    },
+                    |ui, c| {
+                        if primary(ui, "Import").clicked() {
+                            *c = 1;
+                        }
+                        if secondary(ui, "Cancel").clicked() {
+                            *c = 2;
+                        }
+                    },
+                );
+                if r.inner == 1 {
+                    let (p, pres) = (path.clone(), *preserve);
+                    after = Some(Box::new(move |app, _| match formats::import_file(&p, pres) {
+                        Ok(t) => {
+                            app.docs.push(Document::from_table(t.header, t.rows));
+                            app.active = app.docs.len() - 1;
+                            app.msg("Imported — use Save File As to write it as CSV");
+                        }
+                        Err(e) => app.msg(format!("Import failed: {e}")),
+                    }));
+                }
+                keep = r.inner == 0 && !r.dismissed;
+            }
+            Dialog::Export { format, typed, visible_only } => {
+                let r = Dlg::new("export", "Export to JSON or XML").icon(icon::FILE_TEXT, accent).show(
+                    ctx,
+                    |ui| {
+                        section(ui, "Format");
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(format, ExportFormat::Json, "  JSON  ");
+                            ui.selectable_value(format, ExportFormat::Xml, "  XML  ");
+                        });
+                        section(ui, "Options");
+                        ui.add_enabled(*format == ExportFormat::Json, egui::Checkbox::new(typed, "Typed values (numbers, true/false, null)"));
+                        ui.checkbox(visible_only, "Only visible rows and columns");
+                        0u8
+                    },
+                    |ui, c| {
+                        if primary(ui, "Export…").clicked() {
+                            *c = 1;
+                        }
+                        if secondary(ui, "Cancel").clicked() {
+                            *c = 2;
+                        }
+                    },
+                );
+                if r.inner == 1 {
+                    let (f, t, v) = (*format, *typed, *visible_only);
+                    after = Some(Box::new(move |app, ctx| app.export_data(ctx, f, t, v)));
+                }
+                keep = r.inner == 0 && !r.dismissed;
+            }
+            Dialog::Pdf { opts, selection_only, print, title } => {
+                let heading = if *print { "Print" } else { "Export to PDF" };
+                let r = Dlg::new("pdf", heading).icon(icon::PRINTER, accent).width(440.0).show(
+                    ctx,
+                    |ui| {
+                        section(ui, "Page");
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(&mut opts.paper_a4, false, "Letter");
+                            ui.selectable_value(&mut opts.paper_a4, true, "A4");
+                            ui.add_space(12.0);
+                            ui.selectable_value(&mut opts.landscape, false, "Portrait");
+                            ui.selectable_value(&mut opts.landscape, true, "Landscape");
+                        });
+                        ui.add(egui::Slider::new(&mut opts.font_size, 5.0..=16.0).text("Text size"));
+                        section(ui, "Range");
+                        ui.checkbox(selection_only, "Selected cells only");
+                        section(ui, "Layout");
+                        egui::Grid::new("pdfopts").num_columns(2).spacing([24.0, 4.0]).show(ui, |ui| {
+                            ui.checkbox(&mut opts.repeat_headers, "Header on every page");
+                            ui.checkbox(&mut opts.labels, "Row & column labels");
+                            ui.end_row();
+                            ui.checkbox(&mut opts.gridlines, "Gridlines");
+                            ui.checkbox(&mut opts.page_numbers, "Page numbers");
+                            ui.end_row();
+                            ui.checkbox(&mut opts.center_horizontally, "Center horizontally");
+                            ui.checkbox(&mut opts.center_vertically, "Center vertically");
+                            ui.end_row();
+                            ui.checkbox(title, "File name as title");
+                            ui.end_row();
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Page order").color(weak));
+                            ui.selectable_value(&mut opts.row_wise_page_order, true, "Across, then down");
+                            ui.selectable_value(&mut opts.row_wise_page_order, false, "Down, then across");
+                        });
+                        0u8
+                    },
+                    |ui, c| {
+                        if primary(ui, if *print { "Print…" } else { "Export…" }).clicked() {
+                            *c = 1;
+                        }
+                        if secondary(ui, "Cancel").clicked() {
+                            *c = 2;
+                        }
+                    },
+                );
+                if r.inner == 1 {
+                    let mut o = opts.clone();
+                    let (sel, is_print, want_title) = (*selection_only, *print, *title);
+                    after = Some(Box::new(move |app, ctx| app.export_pdf(ctx, &mut o, sel, is_print, want_title)));
+                }
+                keep = r.inner == 0 && !r.dismissed;
+            }
+            Dialog::Filters { col, text, focus } => {
+                let Some(d) = self.docs.get_mut(self.active) else { return };
+                let names: Vec<String> = { let s = d.snap(); (0..d.ncols()).map(|c| s.column_name(c)).collect() };
+                let has_filters = !d.filters.is_empty();
+                let r = Dlg::new("filters", "Filters").icon(icon::FUNNEL, accent).width(520.0).show(
+                    ctx,
+                    |ui| {
+                        let mut err = None;
+                        if d.filters.is_empty() {
+                            ui.label(RichText::new("No filters yet. Rows are shown when they match every filter.").color(weak));
+                        } else {
+                            let mut remove = None;
+                            for (k, f) in d.filters.iter().enumerate() {
+                                let cname = f.col.and_then(|id| d.cols.iter().position(|&x| x == id)).map_or("Any column".to_string(), |c| names[c].clone());
+                                egui::Frame::new().fill(ui.visuals().faint_bg_color).corner_radius(8).inner_margin(egui::Margin::symmetric(10, 6)).show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new(crate::rtl::visual(&cname).into_owned()).font(ui_kit::semibold(13.0)));
+                                        ui.label(RichText::new(&f.text).monospace().color(accent));
+                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                            if ui_kit::tool_button(ui, icon::X, "Remove filter", true).clicked() {
+                                                remove = Some(k);
+                                            }
+                                        });
+                                    });
+                                });
+                            }
+                            if let Some(k) = remove {
+                                d.filters.remove(k);
+                                d.view_dirty = true;
+                            }
+                        }
+                        section(ui, "Add filter");
+                        ui.horizontal(|ui| {
+                            egui::ComboBox::from_id_salt("fcol")
+                                .width(150.0)
+                                .selected_text(col.map_or("Any column".to_string(), |c| crate::rtl::visual(names.get(c).map(String::as_str).unwrap_or("")).into_owned()))
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(col, None, "Any column");
+                                    for (c, n) in names.iter().enumerate() {
+                                        ui.selectable_value(col, Some(c), crate::rtl::visual(n).into_owned());
+                                    }
+                                });
+                            let rr = ui.add(egui::TextEdit::singleline(text).desired_width(230.0).hint_text(">100  |  =done  |  !draft  |  #^\\d+$"));
+                            if *focus {
+                                rr.request_focus();
+                                *focus = false;
+                            }
+                            let enter = rr.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                            if (ui_kit::primary(ui, "Add").clicked() || enter) && !text.trim().is_empty() {
+                                match Query::parse(text) {
+                                    Ok(_) => {
+                                        d.filters.push(Filter { col: col.map(|c| d.cols[c]), text: text.clone() });
+                                        d.view_dirty = true;
+                                        text.clear();
+                                    }
+                                    Err(e) => err = Some(e),
+                                }
+                            }
+                        });
+                        ui.collapsing(RichText::new("Filter syntax").color(weak), |ui| {
+                            egui::Grid::new("syntax").num_columns(2).spacing([16.0, 3.0]).show(ui, |ui| {
+                                for (a, b) in [
+                                    ("foo", "contains foo"),
+                                    ("=foo", "equals foo"),
+                                    ("f*o", "wildcard"),
+                                    ("!foo", "does not contain"),
+                                    ("a | b    a & b", "or / and"),
+                                    (">5  <=10  10-20", "numbers"),
+                                    ("50+   50-", "at least / at most"),
+                                    ("!", "not empty"),
+                                    ("#regex", "regular expression"),
+                                ] {
+                                    ui.label(RichText::new(a).monospace().color(accent));
+                                    ui.label(RichText::new(b).color(weak));
+                                    ui.end_row();
+                                }
+                            });
+                        });
+                        (err, 0u8)
+                    },
+                    |ui, (_, c)| {
+                        if primary(ui, "Done").clicked() {
+                            *c = 1;
+                        }
+                        if has_filters {
+                            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                if danger(ui, "Remove All").clicked() {
+                                    *c = 2;
+                                }
+                            });
+                        }
+                    },
+                );
+                let (err, c) = r.inner;
+                if let Some(e) = err {
+                    after = Some(Box::new(move |app, _| app.msg(e)));
+                }
+                if c == 2 {
+                    d.filters.clear();
+                    d.view_dirty = true;
+                }
+                keep = c != 1 && !r.dismissed;
+            }
+            Dialog::Lookup(st) => {
+                if st.src_doc >= self.docs.len() || self.docs.is_empty() {
+                    return;
+                }
+                let doc_names: Vec<String> = self.docs.iter().map(|d| d.title()).collect();
+                let src_names: Vec<String> = { let s = self.docs[st.src_doc].snap(); (0..s.ncols()).map(|c| crate::rtl::visual(&s.column_name(c)).into_owned()).collect() };
+                let dst_title = self.docs[self.active].title();
+                let dst_names: Vec<String> = { let s = self.docs[self.active].snap(); (0..s.ncols()).map(|c| crate::rtl::visual(&s.column_name(c)).into_owned()).collect() };
+                let src_ncols: Vec<usize> = self.docs.iter().map(|d| d.ncols()).collect();
+                let r = Dlg::new("lookup", "Column Lookup").icon(icon::TABLE, accent).width(500.0).show(
+                    ctx,
+                    |ui| {
+                        ui.label(RichText::new("Copy values from a lookup file into this file by matching key columns, like VLOOKUP.").color(weak));
+                        section(ui, "From");
+                        egui::Grid::new("lk1").num_columns(2).spacing([12.0, 8.0]).min_col_width(120.0).show(ui, |ui| {
+                            ui.label("Lookup file");
+                            let before = st.src_doc;
+                            egui::ComboBox::from_id_salt("lsrc").width(260.0).selected_text(&doc_names[st.src_doc]).show_ui(ui, |ui| {
+                                for (i, n) in doc_names.iter().enumerate() {
+                                    ui.selectable_value(&mut st.src_doc, i, n);
+                                }
+                            });
+                            if before != st.src_doc {
+                                st.src_vals = vec![false; src_ncols[st.src_doc]];
+                                st.src_key = 0;
+                            }
+                            ui.end_row();
+                            ui.label("Key column");
+                            egui::ComboBox::from_id_salt("lkey").width(260.0).selected_text(src_names.get(st.src_key).cloned().unwrap_or_default()).show_ui(ui, |ui| {
+                                for (c, n) in src_names.iter().enumerate() {
+                                    ui.selectable_value(&mut st.src_key, c, n);
+                                }
+                            });
+                            ui.end_row();
+                            ui.label("Values to copy");
+                            egui::ScrollArea::vertical().max_height(130.0).id_salt("lvals").show(ui, |ui| {
+                                st.src_vals.resize(src_names.len(), false);
+                                for (c, n) in src_names.iter().enumerate() {
+                                    if c != st.src_key {
+                                        ui.checkbox(&mut st.src_vals[c], n);
+                                    }
+                                }
+                            });
+                            ui.end_row();
+                        });
+                        section(ui, &format!("Into {dst_title}"));
+                        egui::Grid::new("lk2").num_columns(2).spacing([12.0, 8.0]).min_col_width(120.0).show(ui, |ui| {
+                            ui.label("Key column");
+                            egui::ComboBox::from_id_salt("ldk").width(260.0).selected_text(dst_names.get(st.dst_key).cloned().unwrap_or_default()).show_ui(ui, |ui| {
+                                for (c, n) in dst_names.iter().enumerate() {
+                                    ui.selectable_value(&mut st.dst_key, c, n);
+                                }
+                            });
+                            ui.end_row();
+                            ui.label("Output");
+                            ui.vertical(|ui| {
+                                ui.radio_value(&mut st.insert, true, "Insert new columns after the key");
+                                ui.radio_value(&mut st.insert, false, "Overwrite columns starting at:");
+                                if !st.insert {
+                                    egui::ComboBox::from_id_salt("lds").width(200.0).selected_text(dst_names.get(st.dst_start).cloned().unwrap_or("(new)".into())).show_ui(ui, |ui| {
+                                        for (c, n) in dst_names.iter().enumerate() {
+                                            ui.selectable_value(&mut st.dst_start, c, n);
+                                        }
+                                    });
+                                }
+                            });
+                            ui.end_row();
+                        });
+                        0u8
+                    },
+                    |ui, c| {
+                        if primary(ui, "Run Lookup").clicked() {
+                            *c = 1;
+                        }
+                        if secondary(ui, "Cancel").clicked() {
+                            *c = 2;
+                        }
+                    },
+                );
+                if r.inner == 1 {
+                    let st2 = LookupState { src_vals: st.src_vals.clone(), ..*st };
+                    after = Some(Box::new(move |app, _| app.run_lookup(&st2)));
+                }
+                keep = r.inner == 0 && !r.dismissed;
+            }
+            Dialog::Preferences => {
                 let mut open = true;
-                egui::Window::new("About ficsv").open(&mut open).show(ctx, |ui| {
-                    ui.heading("ficsv");
-                    ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
-                    ui.label("A fast CSV editor for very large files.");
-                    ui.label("Memory-mapped loading, background indexing, filtering, sorting, analysis and transforms.");
-                });
+                let mut apply_fonts = false;
+                let s = &mut self.settings;
+                egui::Window::new(RichText::new("Preferences").font(ui_kit::semibold(15.0)))
+                    .open(&mut open)
+                    .collapsible(false)
+                    .resizable(false)
+                    .default_width(500.0)
+                    .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                    .show(ctx, |ui| {
+                        egui::ScrollArea::vertical().max_height(560.0).show(ui, |ui| {
+                            section(ui, "Appearance");
+                            ui.horizontal_wrapped(|ui| {
+                                for t in Theme::ALL {
+                                    let tv = t.visuals();
+                                    let sel = s.theme == t;
+                                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(88.0, 58.0), egui::Sense::click());
+                                    let pnt = ui.painter();
+                                    pnt.rect_filled(rect, 8, tv.panel_fill);
+                                    pnt.rect_filled(egui::Rect::from_min_size(rect.min + egui::vec2(8.0, 8.0), egui::vec2(72.0, 22.0)), 4, tv.extreme_bg_color);
+                                    pnt.circle_filled(rect.min + egui::vec2(18.0, 19.0), 5.0, tv.selection.stroke.color);
+                                    pnt.text(rect.center_bottom() - egui::vec2(0.0, 12.0), egui::Align2::CENTER_CENTER, t.label(), egui::FontId::proportional(11.0), tv.text_color());
+                                    let stroke = if sel { egui::Stroke::new(2.0, accent) } else { egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color) };
+                                    pnt.rect_stroke(rect, 8, stroke, egui::StrokeKind::Inside);
+                                    if resp.clicked() {
+                                        s.theme = t;
+                                    }
+                                }
+                            });
+                            egui::Grid::new("prefs-a").num_columns(2).spacing([16.0, 8.0]).min_col_width(170.0).show(ui, |ui| {
+                                ui.label("Text size");
+                                ui.add(egui::Slider::new(&mut s.font_size, 10.0..=20.0).step_by(0.5));
+                                ui.end_row();
+                                ui.label("Row height");
+                                ui.add(egui::Slider::new(&mut s.row_height, 18.0..=40.0).step_by(1.0));
+                                ui.end_row();
+                            });
+                            section(ui, "Table");
+                            egui::Grid::new("prefs-t").num_columns(2).spacing([24.0, 4.0]).show(ui, |ui| {
+                                ui.checkbox(&mut s.shade_rows, "Shade alternate rows");
+                                ui.checkbox(&mut s.shade_cols, "Shade alternate columns");
+                                ui.end_row();
+                                ui.checkbox(&mut s.highlight_cursor_cross, "Highlight row & column");
+                                ui.checkbox(&mut s.col_letters, "Columns as letters");
+                                ui.end_row();
+                                ui.checkbox(&mut s.show_row_labels, "Row numbers");
+                                ui.checkbox(&mut s.show_col_labels, "Column labels");
+                                ui.end_row();
+                            });
+                            egui::Grid::new("prefs-t2").num_columns(2).spacing([16.0, 8.0]).min_col_width(170.0).show(ui, |ui| {
+                                ui.label("First row number");
+                                ui.add(egui::DragValue::new(&mut s.first_row_index));
+                                ui.end_row();
+                                ui.label("First column number");
+                                ui.add(egui::DragValue::new(&mut s.first_col_index));
+                                ui.end_row();
+                                ui.label("Max auto-fit width");
+                                ui.add(egui::Slider::new(&mut s.max_autofit_width, 120.0..=1600.0).suffix(" px"));
+                                ui.end_row();
+                            });
+                            section(ui, "Files");
+                            egui::Grid::new("prefs-f").num_columns(2).spacing([24.0, 4.0]).show(ui, |ui| {
+                                ui.checkbox(&mut s.default_header, "First row is a header");
+                                ui.checkbox(&mut s.auto_detect_delimiter, "Auto-detect delimiter");
+                                ui.end_row();
+                                ui.checkbox(&mut s.retain_filters_on_refresh, "Keep filters on reload");
+                                ui.checkbox(&mut s.save_after_each_edit, "Save after each edit");
+                                ui.end_row();
+                                ui.checkbox(&mut s.show_toolbar, "Show toolbar");
+                                ui.end_row();
+                            });
+                            egui::Grid::new("prefs-f2").num_columns(2).spacing([16.0, 8.0]).min_col_width(170.0).show(ui, |ui| {
+                                ui.label("When a file changes on disk");
+                                egui::ComboBox::from_id_salt("ext").selected_text(format!("{:?}", s.external_change)).show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut s.external_change, ExternalChange::Refresh, "Refresh");
+                                    ui.selectable_value(&mut s.external_change, ExternalChange::Ask, "Ask");
+                                    ui.selectable_value(&mut s.external_change, ExternalChange::Ignore, "Ignore");
+                                });
+                                ui.end_row();
+                                ui.label("Open read-only above (MB)");
+                                ui.add(egui::DragValue::new(&mut s.read_only_threshold_mb).suffix(" MB")).on_hover_text("0 = never");
+                                ui.end_row();
+                            });
+                            section(ui, "Dhivehi");
+                            ui.horizontal(|ui| {
+                                let found = crate::rtl::find_faruma(&s.dhivehi_font);
+                                let hint = found.as_ref().map_or("Using the bundled Faruma".to_string(), |p| format!("Auto: {}", p.display()));
+                                ui.add(egui::TextEdit::singleline(&mut s.dhivehi_font).hint_text(hint).desired_width(300.0));
+                                if ui.button("Browse…").clicked() {
+                                    if let Some(p) = rfd::FileDialog::new().add_filter("Font", &["ttf", "otf"]).pick_file() {
+                                        s.dhivehi_font = p.to_string_lossy().into_owned();
+                                        apply_fonts = true;
+                                    }
+                                }
+                            });
+                            section(ui, "Integrations");
+                            egui::Grid::new("prefs-i").num_columns(2).spacing([16.0, 8.0]).min_col_width(170.0).show(ui, |ui| {
+                                ui.label("Search engine URL");
+                                ui.add(egui::TextEdit::singleline(&mut s.search_engine).desired_width(280.0));
+                                ui.end_row();
+                                ui.label("Map search URL");
+                                ui.add(egui::TextEdit::singleline(&mut s.map_engine).desired_width(280.0));
+                                ui.end_row();
+                                ui.label("Text editor command");
+                                ui.add(egui::TextEdit::singleline(&mut s.text_editor).hint_text("System default").desired_width(280.0));
+                                ui.end_row();
+                            });
+                            section(ui, "Delimiter by file extension");
+                            let mut remove = None;
+                            for (ext, del) in s.ext_delimiters.iter_mut() {
+                                ui.horizontal(|ui| {
+                                    ui.label(format!(".{ext}"));
+                                    ui.add(egui::TextEdit::singleline(del).desired_width(40.0));
+                                    if ui_kit::tool_button(ui, icon::X, "Remove", true).clicked() {
+                                        remove = Some(ext.clone());
+                                    }
+                                });
+                            }
+                            if let Some(e) = remove {
+                                s.ext_delimiters.remove(&e);
+                            }
+                            if ui.button((ui_kit::icon_text(icon::PLUS, 13.0), "Add extension")).clicked() {
+                                s.ext_delimiters.insert(format!("ext{}", s.ext_delimiters.len() + 1), ";".into());
+                            }
+                            if let Some(dir) = config_dir() {
+                                ui.add_space(8.0);
+                                ui.label(RichText::new(format!("Settings are saved in {}", dir.join("settings.json").display())).size(11.0).color(weak));
+                            }
+                        });
+                    });
+                if apply_fonts {
+                    let w = crate::rtl::install_fonts(ctx, &self.settings.dhivehi_font);
+                    if let Some(w) = w {
+                        after = Some(Box::new(move |app, _| app.msg(w)));
+                    }
+                }
+                if ctx.input(|i| i.key_pressed(Key::Escape)) && !egui::Popup::is_any_open(ctx) {
+                    open = false;
+                }
                 if !open {
                     keep = false;
+                    self.settings.save();
                 }
             }
         }
@@ -3149,6 +3605,14 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.apply_theme(&ctx);
+        let title = match self.docs.get(self.active) {
+            Some(d) => format!("{}{} — {APP_NAME}", d.title(), if d.dirty { " •" } else { "" }),
+            None => APP_NAME.to_string(),
+        };
+        if self.window_title != title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.window_title = title;
+        }
 
         // Quit confirmation for unsaved files.
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_quit {
@@ -3175,44 +3639,44 @@ impl eframe::App for App {
         self.check_external_changes(&ctx);
         self.handle_shortcuts(&ctx);
 
-        egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui));
+        let v = ctx.global_style().visuals.clone();
+        let bar = |m: egui::Margin| egui::Frame::new().fill(v.panel_fill).inner_margin(m);
+        let line = egui::Stroke::new(1.0, v.widgets.noninteractive.bg_stroke.color);
+        egui::Panel::top("menu").frame(bar(egui::Margin::symmetric(8, 2))).show(ui, |ui| self.menu_bar(ui));
+        if self.settings.show_toolbar {
+            egui::Panel::top("toolbar").frame(bar(egui::Margin::symmetric(8, 3))).show(ui, |ui| self.toolbar(ui));
+        }
         if !self.docs.is_empty() {
-            egui::Panel::top("tabs").show(ui, |ui| self.tab_bar(ui));
+            egui::Panel::top("tabs").frame(bar(egui::Margin { left: 8, right: 8, top: 2, bottom: 0 })).show(ui, |ui| self.tab_bar(ui));
             if self.settings.show_metadata {
-                egui::Panel::top("meta").show(ui, |ui| self.metadata_bar(ui));
+                egui::Panel::top("meta").frame(bar(egui::Margin::symmetric(12, 6)).stroke(line)).show(ui, |ui| self.metadata_bar(ui));
             }
             if self.find_open {
-                egui::Panel::top("find").show(ui, |ui| self.find_bar(ui));
+                egui::Panel::top("find").frame(bar(egui::Margin::symmetric(10, 6)).stroke(line)).show(ui, |ui| self.find_bar(ui));
             }
         }
-        egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
+        egui::Panel::bottom("status").frame(bar(egui::Margin::symmetric(12, 4)).stroke(line)).show(ui, |ui| self.status_bar(ui));
         if self.settings.show_editor_pane && !self.docs.is_empty() {
-            egui::Panel::bottom("editor").resizable(true).default_size(140.0).show(ui, |ui| self.editor_pane(ui));
+            egui::Panel::bottom("editor").frame(bar(egui::Margin::same(10)).stroke(line)).resizable(true).default_size(140.0).show(ui, |ui| self.editor_pane(ui));
         }
         if self.settings.show_sidebar {
-            egui::Panel::left("sidebar").resizable(true).default_size(200.0).show(ui, |ui| self.sidebar(ui));
+            egui::Panel::left("sidebar").frame(bar(egui::Margin::same(10)).stroke(line)).resizable(true).default_size(220.0).show(ui, |ui| self.sidebar(ui));
         }
 
         let find_re = if self.find_open && self.find.highlight { self.find_regex() } else { None };
         let mut ev = None;
         let mut ctx_cmd = None;
-        egui::CentralPanel::no_frame().show(ui, |ui| {
-            if let Some(d) = self.docs.get_mut(self.active) {
-                let out = grid::show(ui, d, &self.settings, find_re.as_ref());
-                ev = out.event;
-                out.response.context_menu(|ui| ctx_cmd = self.context_menu(ui));
-            } else {
-                ui.centered_and_justified(|ui| {
-                    ui.label(
-                        RichText::new(
-                            "Drop a CSV file here, or press ⌘/Ctrl+O to open one.\n\n⌘/Ctrl+Shift+P opens the command launcher.",
-                        )
-                        .size(16.0)
-                        .weak(),
-                    );
-                });
-            }
-        });
+        if self.docs.is_empty() {
+            egui::CentralPanel::default().frame(egui::Frame::new().fill(v.extreme_bg_color)).show(ui, |ui| self.welcome(ui));
+        } else {
+            egui::CentralPanel::no_frame().show(ui, |ui| {
+                if let Some(d) = self.docs.get_mut(self.active) {
+                    let out = grid::show(ui, d, &self.settings, find_re.as_ref());
+                    ev = out.event;
+                    out.response.context_menu(|ui| ctx_cmd = self.context_menu(ui));
+                }
+            });
+        }
         match ev {
             Some(GridEvent::Sort(c)) => {
                 let col_id = self.docs[self.active].cols[c];
@@ -3241,6 +3705,11 @@ impl eframe::App for App {
         self.palette_ui(&ctx);
         self.prompt_ui(&ctx);
         self.dialogs(&ctx);
+        if let Some((m, t)) = &self.status {
+            let low = m.to_lowercase();
+            let warn = ["fail", "could not", "can't", "cannot", "error", "too large", "not found", "invalid"].iter().any(|w| low.contains(w));
+            ui_kit::toast(&ctx, m, t.elapsed().as_secs_f32(), warn);
+        }
 
         if self.docs.iter().any(|d| !d.ready() || d.view_job.is_some() || d.aux_job.is_some()) {
             ctx.request_repaint_after(Duration::from_millis(100));

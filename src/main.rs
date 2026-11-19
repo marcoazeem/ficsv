@@ -12,6 +12,7 @@ mod rtl;
 mod settings;
 mod table;
 mod transforms;
+mod ui_kit;
 #[cfg(test)]
 mod tests;
 
@@ -21,12 +22,12 @@ fn main() -> eframe::Result {
     let files: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("ficsv")
+            .with_title(app::APP_NAME)
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([520.0, 320.0])
             .with_drag_and_drop(true)
             .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon/icon-256.png")).unwrap_or_default()),
         ..Default::default()
     };
-    eframe::run_native("ficsv", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, files)))))
+    eframe::run_native(app::APP_NAME, options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, files)))))
 }

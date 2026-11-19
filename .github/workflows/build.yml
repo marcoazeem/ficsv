@@ -39,14 +39,14 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item target/${{ matrix.target }}/release/ficsv.exe dist/
-          Compress-Archive -Path dist/ficsv.exe -DestinationPath ${{ matrix.artifact }}.zip
+          Copy-Item target/${{ matrix.target }}/release/ficsv.exe "dist/FI CSV.exe"
+          Compress-Archive -Path "dist/FI CSV.exe" -DestinationPath ${{ matrix.artifact }}.zip
       - name: Package (macOS)
         if: runner.os == 'macOS'
         run: |
           ./scripts/bundle-macos.sh target/${{ matrix.target }}/release/ficsv dist
-          codesign --force --deep --sign - dist/ficsv.app
-          ditto -c -k --keepParent dist/ficsv.app ${{ matrix.artifact }}.zip
+          codesign --force --deep --sign - "dist/FI CSV.app"
+          ditto -c -k --norsrc --keepParent "dist/FI CSV.app" ${{ matrix.artifact }}.zip
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
@@ -74,5 +74,5 @@ jobs:
             - **Windows (64-bit)**: `ficsv-windows-x64.zip`
 
             The builds are not notarized / code-signed with a paid certificate:
-            - macOS: unzip, then right-click `ficsv.app` → **Open** the first time (or run `xattr -dr com.apple.quarantine ficsv.app`).
+            - macOS: unzip, then right-click **FI CSV.app** → **Open** the first time (or run `xattr -dr com.apple.quarantine "FI CSV.app"`).
             - Windows: SmartScreen may warn — click **More info → Run anyway**.

@@ -1,4 +1,4 @@
-# ficsv
+# FI CSV
 
 A fast desktop CSV/TSV editor for very large files, written in Rust (egui). Runs on macOS and Windows (and Linux).
 Its feature set follows [Modern CSV](https://www.moderncsv.com/), including the Premium and Premium Business features.
@@ -44,7 +44,7 @@ cargo test                                   # 53 tests
 cargo test --release perf_big_file -- --ignored --nocapture   # 5M-row benchmark
 ```
 
-* **macOS app:** `cargo build --release && scripts/bundle-macos.sh` → `dist/ficsv.app`
+* **macOS app:** `cargo build --release && scripts/bundle-macos.sh` → `dist/FI CSV.app`
 * **Windows:** `cargo build --release` on Windows → `target\release\ficsv.exe` (no console window in release builds)
 * **CI:** `.github/workflows/build.yml` builds Windows x64 and macOS arm64/x64 on every push and uploads them as artifacts.
 
@@ -74,4 +74,4 @@ cargo test --release perf_big_file -- --ignored --nocapture   # 5M-row benchmark
 ## Download
 
 Prebuilt macOS (Apple Silicon / Intel) and Windows builds are attached to each [GitHub Release](../../releases).
-They are not notarized: on macOS right-click `ficsv.app` → **Open** the first time; on Windows choose **More info → Run anyway** if SmartScreen warns.
+They are not notarized: on macOS right-click **FI CSV.app** → **Open** the first time; on Windows choose **More info → Run anyway** if SmartScreen warns.

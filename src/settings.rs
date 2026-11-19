@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use egui::{Color32, Visuals};
+use egui::Visuals;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -28,33 +28,7 @@ impl Theme {
     }
 
     pub fn visuals(self) -> Visuals {
-        let hex = |s: u32| Color32::from_rgb((s >> 16) as u8, (s >> 8) as u8, s as u8);
-        // (dark?, background, panel, faint/stripe, text, accent, selection)
-        let (dark, bg, panel, faint, text, accent, sel) = match self {
-            Theme::Light => return Visuals::light(),
-            Theme::Dark => return Visuals::dark(),
-            Theme::Dracula => (true, 0x282a36, 0x21222c, 0x2f3140, 0xf8f8f2, 0xbd93f9, 0x44475a),
-            Theme::SolarizedDark => (true, 0x002b36, 0x073642, 0x053340, 0x93a1a1, 0x268bd2, 0x0a4a5c),
-            Theme::SolarizedLight => (false, 0xfdf6e3, 0xeee8d5, 0xf5efdc, 0x586e75, 0x268bd2, 0xd3e5f0),
-        };
-        let mut v = if dark { Visuals::dark() } else { Visuals::light() };
-        let (bg, panel, faint, text, accent, sel) = (hex(bg), hex(panel), hex(faint), hex(text), hex(accent), hex(sel));
-        v.extreme_bg_color = bg;
-        v.panel_fill = panel;
-        v.window_fill = panel;
-        v.faint_bg_color = faint;
-        v.override_text_color = Some(text);
-        v.hyperlink_color = accent;
-        v.selection.bg_fill = sel.lerp_to_gamma(accent, 0.35);
-        v.selection.stroke.color = accent;
-        v.widgets.noninteractive.bg_fill = panel;
-        v.widgets.noninteractive.weak_bg_fill = panel;
-        v.widgets.inactive.bg_fill = sel;
-        v.widgets.inactive.weak_bg_fill = sel.gamma_multiply(0.8);
-        v.widgets.hovered.weak_bg_fill = sel.lerp_to_gamma(accent, 0.2);
-        v.widgets.active.weak_bg_fill = sel.lerp_to_gamma(accent, 0.4);
-        v.widgets.noninteractive.bg_stroke.color = sel;
-        v
+        crate::ui_kit::visuals(self)
     }
 }
 
@@ -95,6 +69,7 @@ pub struct Settings {
     pub show_sidebar: bool,
     pub show_metadata: bool,
     pub show_editor_pane: bool,
+    pub show_toolbar: bool,
     pub folders: Vec<String>,
     /// Path to the Faruma font for Dhivehi (blank = auto-detect).
     pub dhivehi_font: String,
@@ -129,6 +104,7 @@ impl Default for Settings {
             show_sidebar: false,
             show_metadata: false,
             show_editor_pane: false,
+            show_toolbar: true,
             folders: Vec::new(),
             dhivehi_font: String::new(),
         }

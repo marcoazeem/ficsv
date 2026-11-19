@@ -6,8 +6,8 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         let mut res = winresource::WindowsResource::new();
         res.set_icon("assets/icon/ficsv.ico");
-        res.set("ProductName", "ficsv");
-        res.set("FileDescription", "ficsv - fast CSV editor");
+        res.set("ProductName", "FI CSV");
+        res.set("FileDescription", "FI CSV");
         if let Err(e) = res.compile() {
             println!("cargo::warning=could not embed Windows icon: {e}");
         }

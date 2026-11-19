@@ -660,7 +660,7 @@ pub fn show(ui: &mut Ui, doc: &mut Document, s: &Settings, find_re: Option<&Rege
     let find_fill = Color32::from_rgba_unmultiplied(255, 190, 0, 80);
     let edited_col = Color32::from_rgb(230, 140, 30);
     let font = FontId::proportional(s.font_size);
-    let bold = FontId::new(s.font_size, egui::FontFamily::Name("bold".into()));
+    let bold = FontId::new(s.font_size, egui::FontFamily::Name("semibold".into()));
     let bold = if ui.fonts(|f| f.families().iter().any(|fam| *fam == bold.family)) { bold } else { font.clone() };
     let small = FontId::proportional((s.font_size - 2.0).max(9.0));
     let mono = FontId::monospace((s.font_size - 1.5).max(9.0));
