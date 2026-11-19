@@ -46,7 +46,9 @@ cargo test --release perf_big_file -- --ignored --nocapture   # 5M-row benchmark
 
 * **macOS app:** `cargo build --release && scripts/bundle-macos.sh` → `dist/FI CSV.app`
 * **Windows:** `cargo build --release` on Windows → `target\release\ficsv.exe` (no console window in release builds)
-* **CI:** `.github/workflows/build.yml` builds Windows x64 and macOS arm64/x64 on every push and uploads them as artifacts.
+* **Linux:** needs `libxkbcommon-dev libwayland-dev libgl1-mesa-dev libxcb-*-dev` (Debian/Ubuntu names). `cargo build --release && scripts/package-linux.sh`
+  → `dist/ficsv-linux/` with the binary, a `.desktop` launcher, the icon and `install.sh` (per-user install into `~/.local`).
+* **CI:** `.github/workflows/build.yml` builds Windows x64, macOS arm64/x64 and Linux x64/arm64 on every push and uploads them as artifacts.
 
 ## Code map
 

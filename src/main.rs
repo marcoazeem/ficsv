@@ -24,6 +24,8 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(app::APP_NAME)
+            // Wayland/X11 app id: matches ficsv.desktop so the dock shows the right icon.
+            .with_app_id("ficsv")
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([520.0, 320.0])
             .with_drag_and_drop(true)

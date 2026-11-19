@@ -2,8 +2,8 @@
 //!
 //! * `check` asks the GitHub API for the latest release and compares versions.
 //! * `install` downloads this platform's zip, swaps the app in place and returns the
-//!   path to relaunch. macOS replaces the whole `FI CSV.app` bundle; Windows replaces the
-//!   running `.exe` (via `self_replace`).
+//!   path to relaunch. macOS replaces the whole `FI CSV.app` bundle; Windows and Linux
+//!   replace the running executable (via `self_replace`).
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -41,6 +41,10 @@ pub fn asset_name() -> Option<&'static str> {
         Some("ficsv-macos-x64.zip")
     } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
         Some("ficsv-windows-x64.zip")
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        Some("ficsv-linux-x64.zip")
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        Some("ficsv-linux-arm64.zip")
     } else {
         None
     }
@@ -88,7 +92,7 @@ pub fn check_against(current: &str) -> Result<Option<Release>, String> {
     Ok(is_newer(&rel.version, current).then_some(rel))
 }
 
-/// The installed app to replace: the `.app` bundle on macOS, the `.exe` on Windows.
+/// The installed app to replace: the `.app` bundle on macOS, the executable elsewhere.
 pub fn install_target() -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
@@ -139,7 +143,7 @@ pub fn install_to(rel: &Release, target: PathBuf, progress: &AtomicU64) -> Resul
             return Err(format!("download incomplete ({got} of {} bytes)", rel.asset_size));
         }
     }
-    let result = if cfg!(target_os = "macos") { install_macos(&zip_path, &target) } else { install_windows(&zip_path, &target, &work) };
+    let result = if cfg!(target_os = "macos") { install_macos(&zip_path, &target) } else { install_binary(&zip_path, &work) };
     let _ = std::fs::remove_dir_all(&work);
     result.map(|_| target)
 }
@@ -180,19 +184,36 @@ fn install_macos(zip_path: &Path, bundle: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn install_windows(zip_path: &Path, _exe: &Path, work: &Path) -> Result<(), String> {
+/// Name of the executable inside the Windows / Linux release zip.
+const BINARY_NAME: &str = if cfg!(windows) { ".exe" } else { "ficsv" };
+
+/// True for the zip entry holding the app binary ("FI CSV.exe" on Windows, "…/ficsv" on Linux).
+fn is_binary_entry(name: &str) -> bool {
+    if cfg!(windows) {
+        name.to_ascii_lowercase().ends_with(BINARY_NAME)
+    } else {
+        name.rsplit('/').next() == Some(BINARY_NAME)
+    }
+}
+
+fn install_binary(zip_path: &Path, work: &Path) -> Result<(), String> {
     let file = std::fs::File::open(zip_path).map_err(|e| e.to_string())?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("bad update archive: {e}"))?;
     let idx = (0..archive.len())
-        .find(|&i| archive.by_index(i).map(|f| f.name().to_ascii_lowercase().ends_with(".exe")).unwrap_or(false))
-        .ok_or("update doesn't contain an .exe")?;
-    let new_exe = work.join("new.exe");
+        .find(|&i| archive.by_index(i).map(|f| f.is_file() && is_binary_entry(f.name())).unwrap_or(false))
+        .ok_or("update doesn't contain the app")?;
+    let new_exe = work.join(if cfg!(windows) { "new.exe" } else { "new-ficsv" });
     {
         let mut entry = archive.by_index(idx).map_err(|e| e.to_string())?;
         let mut out = std::fs::File::create(&new_exe).map_err(|e| e.to_string())?;
         std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
     }
-    // Windows can't overwrite a running .exe; self_replace moves it aside first.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&new_exe, std::fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
+    }
+    // A running executable can't simply be overwritten; self_replace moves it aside first.
     self_replace::self_replace(&new_exe).map_err(|e| format!("can't replace the app: {e}"))
 }
 
@@ -255,5 +276,17 @@ mod tests {
         assert_eq!(r.asset_url, "https://e/m.zip");
         assert_eq!(r.asset_size, 20);
         assert!(parse_release(json, "ficsv-macos-x64.zip").is_err());
+    }
+
+    #[test]
+    fn finds_binary_in_zip() {
+        if cfg!(windows) {
+            assert!(is_binary_entry("FI CSV.exe"));
+        } else {
+            assert!(is_binary_entry("ficsv-linux-x64/ficsv"));
+            assert!(is_binary_entry("ficsv"));
+            assert!(!is_binary_entry("ficsv-linux-x64/ficsv.desktop"));
+            assert!(!is_binary_entry("ficsv-linux-x64/"));
+        }
     }
 }
