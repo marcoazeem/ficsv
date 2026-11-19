@@ -1,11 +1,11 @@
-"""Generate app icons from icon.png.
+"""Generate app icons from a square source image (a rounded tile on a plain page).
 
 Outputs (assets/icon/):
   icon-1024.png  full-bleed master with transparent rounded corners (window icon)
   ficsv.ico      Windows icon (16..256)
   ficsv.icns     macOS icon (content inset to Apple's 824/1024 grid)
 
-Usage: python3 -I scripts/make-icons.py icon.png assets/icon
+Usage: python3 -I scripts/make-icons.py assets/icon/source.png assets/icon
 """
 import math
 import subprocess
@@ -21,14 +21,18 @@ img = Image.open(src).convert("RGB")
 W, H = img.size
 assert W == H, "icon must be square"
 
-# Measure the corner radius: walk the diagonal from the top-left until we hit the dark outline.
+# Measure the corner radius: walk the diagonal from the top-left corner (the page
+# background) until the colour changes — that's where the rounded tile begins.
 px = img.load()
+page = px[0, 0]
 d = 0
-while d < W // 2 and sum(px[d, d]) > 200 * 3:
+while d < W // 2 and sum(abs(a - b) for a, b in zip(px[d, d], page)) < 30:
     d += 1
 radius = d / (1 - 1 / math.sqrt(2)) if d else W * 0.09
-inset = 4  # drop the thin outline stroke
-print(f"corner hit at {d}px -> radius ~{radius:.0f}px")
+# A dark outline stroke around the tile gets trimmed off; a plain tile edge only needs 1px.
+inset = 4 if sum(px[d, d]) < 200 * 3 else 1
+tile_color = px[W // 2, inset + 4]  # the tile's own background, used to fill the macOS shape
+print(f"corner hit at {d}px -> radius ~{radius:.0f}px, tile colour {tile_color}")
 
 # Anti-aliased rounded-rect mask (4x supersampled).
 S = 4
@@ -56,14 +60,13 @@ mask_path = out / "macos-mask.png"
 if not mask_path.exists():
     subprocess.run(["swift", str(Path(__file__).with_name("squircle-mask.swift")), str(mask_path)], check=True)
 squircle = Image.open(mask_path).getchannel("A")
-# Cleaned master (outline + corners removed) flattened onto white.
-art = Image.new("RGBA", master.size, (255, 255, 255, 255))
+# The tile (corners filled with its own background colour) scaled to Apple's 824px body;
+# the squircle mask then gives it macOS's corner shape.
+art = Image.new("RGBA", master.size, (*tile_color[:3], 255))
 art.alpha_composite(master)
-# Inset the artwork (86%) on the white background so the logo clears Apple's rounder corners.
-inner = round(824 * 0.86)
-art = art.resize((inner, inner), Image.LANCZOS)
-mac = Image.new("RGBA", (1024, 1024), (255, 255, 255, 255))
-mac.paste(art, ((1024 - inner) // 2, (1024 - inner) // 2))
+art = art.resize((824, 824), Image.LANCZOS)
+mac = Image.new("RGBA", (1024, 1024), (*tile_color[:3], 255))
+mac.paste(art, (100, 100))
 mac.putalpha(squircle)
 mac.save(out / "macos-1024.png")
 with tempfile.TemporaryDirectory() as t:

@@ -1,3 +1,5 @@
+<img src="assets/icon/icon-256.png" width="96" align="right" alt="FI CSV icon">
+
 # FI CSV
 
 A fast desktop CSV/TSV editor for very large files, written in Rust (egui). Runs on macOS and Windows (and Linux).
@@ -5,11 +7,13 @@ Its feature set follows [Modern CSV](https://www.moderncsv.com/), including the 
 
 ![FI CSV showing a 5,000-row orders file in the dark theme](docs/screenshots/main.png)
 
-| Command launcher (⌘⇧P / Ctrl+Shift+P) | File Analysis: unique values |
+| Welcome screen | Command launcher (⌘⇧P / Ctrl+Shift+P) |
 |---|---|
-| ![Command launcher with fuzzy search](docs/screenshots/command-launcher.png) | ![Unique values with histogram](docs/screenshots/unique-values.png) |
+| ![Welcome screen with the app icon](docs/screenshots/welcome.png) | ![Command launcher with fuzzy search](docs/screenshots/command-launcher.png) |
 
-![Right-to-left Dhivehi, Arabic, Hebrew, Persian and Urdu next to CJK text, light theme](docs/screenshots/rtl-light.png)
+| File Analysis: unique values | Right-to-left and CJK text, light theme |
+|---|---|
+| ![Unique values with histogram](docs/screenshots/unique-values.png) | ![Right-to-left Dhivehi, Arabic, Hebrew, Persian and Urdu next to CJK text](docs/screenshots/rtl-light.png) |
 
 ## Why it's fast
 
