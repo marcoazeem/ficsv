@@ -49,10 +49,23 @@ master.resize((256, 256), Image.LANCZOS).save(out / "icon-256.png")
 # Windows .ico
 master.save(out / "ficsv.ico", sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
 
-# macOS .icns: Apple's grid puts the rounded square at 824/1024, centred.
-mac = Image.new("RGBA", (1024, 1024), (0, 0, 0, 0))
-body = master.resize((824, 824), Image.LANCZOS)
-mac.alpha_composite(body, (100, 100))
+# macOS .icns: macOS 26 only shows an icon as-is when its shape is Apple's continuous-corner
+# rounded square (824px body on a 1024px canvas); anything else gets put in a grey tile.
+# Fill that exact shape (mask rendered by scripts/squircle-mask.swift) with the artwork.
+mask_path = out / "macos-mask.png"
+if not mask_path.exists():
+    subprocess.run(["swift", str(Path(__file__).with_name("squircle-mask.swift")), str(mask_path)], check=True)
+squircle = Image.open(mask_path).getchannel("A")
+# Cleaned master (outline + corners removed) flattened onto white.
+art = Image.new("RGBA", master.size, (255, 255, 255, 255))
+art.alpha_composite(master)
+# Inset the artwork (86%) on the white background so the logo clears Apple's rounder corners.
+inner = round(824 * 0.86)
+art = art.resize((inner, inner), Image.LANCZOS)
+mac = Image.new("RGBA", (1024, 1024), (255, 255, 255, 255))
+mac.paste(art, ((1024 - inner) // 2, (1024 - inner) // 2))
+mac.putalpha(squircle)
+mac.save(out / "macos-1024.png")
 with tempfile.TemporaryDirectory() as t:
     iconset = Path(t) / "ficsv.iconset"
     iconset.mkdir()

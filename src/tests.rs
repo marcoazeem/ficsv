@@ -25,7 +25,7 @@ fn open(p: &PathBuf) -> Document {
         assert!(t.elapsed() < Duration::from_secs(60), "indexing timed out");
         std::thread::sleep(Duration::from_millis(5));
     }
-    d.measure_if_needed(7.0, 300.0);
+    d.measure_if_needed(&|t: &str| t.chars().count() as f32 * 7.0, 300.0);
     d
 }
 
@@ -190,4 +190,31 @@ fn perf_big_file() {
     let t = Instant::now();
     let _ = save_to_string(&d, &std::env::temp_dir().join("ficsv-perf-out.csv"));
     println!("save (raw copy) in {:?}", t.elapsed());
+}
+
+#[test]
+fn autofit_fits_rtl_text() {
+    // Real fonts (Faruma for Thaana, Arial for Arabic/Hebrew) and real text measurement.
+    let ctx = egui::Context::default();
+    crate::rtl::install_fonts(&ctx, "");
+    ctx.begin_pass(egui::RawInput::default());
+    let font = egui::FontId::proportional(13.0);
+    let measure = |t: &str| -> f32 {
+        let shown = crate::rtl::visual(t).into_owned();
+        ctx.fonts_mut(|f| f.layout_no_wrap(shown, font.clone(), egui::Color32::WHITE).size().x)
+    };
+    let long_dv = "ދިވެހިރާއްޖޭގެ ޖުމްހޫރިއްޔާ - ރާއްޖޭގެ ވެރިރަށް މާލެ";
+    let long_ar = "جمهورية مصر العربية - القاهرة عاصمة البلاد";
+    let long_he = "מדינת ישראל - ירושלים היא הבירה";
+    let csv = format!("dv,ar,he\nx,y,z\n{long_dv},{long_ar},{long_he}\n");
+    let p = tmp("rtl-fit.csv", csv.as_bytes());
+    let mut d = open(&p);
+    for (c, text) in [(0, long_dv), (1, long_ar), (2, long_he)] {
+        let need = measure(text);
+        assert!(need > 150.0, "{text}: measured {need}px — glyphs missing?");
+        d.autofit_col(c, &measure, 3000.0);
+        let w = d.width_of(c);
+        assert!(w >= need + 20.0, "column {c} is {w}px but text needs {need}px");
+    }
+    let _ = ctx.end_pass();
 }

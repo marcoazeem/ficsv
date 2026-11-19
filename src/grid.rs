@@ -230,7 +230,19 @@ fn commit_edit(doc: &mut Document) -> bool {
 pub fn show(ui: &mut Ui, doc: &mut Document, s: &Settings, find_re: Option<&Regex>) -> GridOut {
     let mut event = None;
     let row_h = s.row_height.max(s.font_size + 6.0);
-    doc.measure_if_needed(s.char_width(), s.max_autofit_width);
+    let measure_font = FontId::proportional(s.font_size);
+    let painter_for_measure = ui.painter().clone();
+    let measure = move |t: &str| -> f32 {
+        let shown = rtl::visual(&display_text(t)).into_owned();
+        painter_for_measure.layout_no_wrap(shown, measure_font.clone(), Color32::WHITE).size().x
+    };
+    doc.measure_if_needed(&measure, s.max_autofit_width.max(240.0));
+    // Explicit auto-fit (double-click / command) fits the content, up to a generous cap.
+    for c in std::mem::take(&mut doc.grid.autofit) {
+        if c < doc.ncols() {
+            doc.autofit_col(c, &measure, 3000.0);
+        }
+    }
 
     let rect = ui.available_rect_before_wrap();
     let resp = ui.interact(rect, grid_id(), Sense::click_and_drag());
@@ -293,7 +305,7 @@ pub fn show(ui: &mut Ui, doc: &mut Document, s: &Settings, find_re: Option<&Rege
         if x <= body.left() {
             return None;
         }
-        (0..ncols_v).find(|&c| (body.left() + prefix[c + 1] - sx - x).abs() < 4.0)
+        (0..ncols_v).find(|&c| (body.left() + prefix[c + 1] - sx - x).abs() < 6.0)
     };
 
     // ---------- Pointer ----------
@@ -321,7 +333,17 @@ pub fn show(ui: &mut Ui, doc: &mut Document, s: &Settings, find_re: Option<&Rege
             } else if p.y < top_strip {
                 if let Some(c) = border_at(p.x, sx) {
                     let id = doc.cols[doc.vcols[c]];
-                    doc.grid.drag = Drag::Resize(id, p.x - widths[c]);
+                    // Second press on the same border within 0.45 s = double-click: auto-fit.
+                    let now = ui.input(|i| i.time);
+                    if doc.grid.last_border_press.is_some_and(|(t, lc)| lc == c && now - t < 0.45) {
+                        doc.grid.autofit.push(doc.vcols[c]);
+                        doc.grid.last_border_press = None;
+                        ui.ctx().request_repaint();
+                    } else {
+                        doc.grid.last_border_press = Some((now, c));
+                    }
+                    // Remember the column's left edge in content coordinates.
+                    doc.grid.drag = Drag::Resize(id, prefix[c]);
                 } else if p.x < body.left() {
                     doc.grid.anchor = (0, 0);
                     doc.grid.cur = (nrows.saturating_sub(1), ncols_v.saturating_sub(1));
@@ -359,8 +381,18 @@ pub fn show(ui: &mut Ui, doc: &mut Document, s: &Settings, find_re: Option<&Rege
     if down {
         if let Some(p) = pointer {
             match doc.grid.drag {
-                Drag::Resize(id, base) => {
-                    doc.widths.insert(id, (p.x - base).max(MIN_COL_W));
+                Drag::Resize(id, left) => {
+                    // Auto-scroll when dragging past the right edge so the column can keep growing.
+                    let edge = body.right() - 12.0;
+                    if p.x > edge {
+                        doc.grid.scroll_x += ((p.x - edge) * 0.6).clamp(6.0, 60.0);
+                        ui.ctx().request_repaint();
+                    } else if p.x < body.left() + 12.0 && doc.grid.scroll_x > 0.0 {
+                        doc.grid.scroll_x = (doc.grid.scroll_x - 20.0).max(0.0);
+                        ui.ctx().request_repaint();
+                    }
+                    let content_x = p.x.min(body.right()) - body.left() + doc.grid.scroll_x;
+                    doc.widths.insert(id, (content_x - left).max(MIN_COL_W));
                 }
                 Drag::VScroll => {
                     let thumb_h = (vs_rect.height() * vis_rows as f32 / nrows.max(1) as f32).clamp(24.0, vs_rect.height());
@@ -400,8 +432,8 @@ pub fn show(ui: &mut Ui, doc: &mut Document, s: &Settings, find_re: Option<&Rege
     if resp.double_clicked() {
         if let Some(p) = pointer {
             if p.y < top_strip {
-                if let Some(c) = border_at(p.x, sx) {
-                    doc.autofit_col(doc.vcols[c], s.char_width(), s.max_autofit_width);
+                if border_at(p.x, sx).is_some() {
+                    // Handled by the border double-press detection above.
                 } else if let Some(c) = col_at(p.x, sx) {
                     let on_header_row = doc.has_header && p.y >= grid.top() + label_h;
                     if on_header_row && label_h > 0.0 && !doc.read_only {

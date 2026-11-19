@@ -116,7 +116,7 @@ impl Default for Settings {
             first_col_index: 1,
             default_header: true,
             auto_detect_delimiter: true,
-            max_autofit_width: 360.0,
+            max_autofit_width: 600.0,
             external_change: ExternalChange::Refresh,
             retain_filters_on_refresh: true,
             save_after_each_edit: false,
@@ -172,7 +172,4 @@ impl Settings {
         self.recent.truncate(15);
     }
 
-    pub fn char_width(&self) -> f32 {
-        self.font_size * 0.56
-    }
 }

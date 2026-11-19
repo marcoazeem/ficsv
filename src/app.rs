@@ -1415,11 +1415,9 @@ impl App {
             ToggleColLabels => self.settings.show_col_labels = !self.settings.show_col_labels,
             SetColWidth => self.ask("Set Column Width", vec![param("w", "Width in pixels", ParamKind::Int, "120")], PromptAction::ColWidth),
             AutofitCols => {
-                let (cw, mw) = (self.settings.char_width(), self.settings.max_autofit_width);
                 if let Some(d) = self.doc() {
-                    for c in d.sel_cols() {
-                        d.autofit_col(c, cw, mw);
-                    }
+                    let cols = d.sel_cols();
+                    d.grid.autofit.extend(cols);
                 }
             }
             ZoomIn => self.settings.font_size = (self.settings.font_size + 1.0).min(28.0),

@@ -678,6 +678,10 @@ pub struct GridState {
     pub edit: Option<CellEdit>,
     pub vis_rows: usize,
     pub body_w: f32,
+    /// Columns to auto-fit on the next frame (table column positions).
+    pub autofit: Vec<usize>,
+    /// Last press on a column border: (time in seconds, column) for double-click detection.
+    pub last_border_press: Option<(f64, usize)>,
 }
 
 impl Default for GridState {
@@ -692,6 +696,8 @@ impl Default for GridState {
             edit: None,
             vis_rows: 30,
             body_w: 800.0,
+            autofit: Vec::new(),
+            last_border_press: None,
         }
     }
 }
@@ -955,7 +961,8 @@ impl Document {
     }
 
     /// Size columns from the first rows once enough of the file is indexed.
-    pub fn measure_if_needed(&mut self, char_w: f32, max_w: f32) {
+    /// `measure` returns the rendered width of a text in pixels.
+    pub fn measure_if_needed(&mut self, measure: &dyn Fn(&str) -> f32, max_w: f32) {
         if self.widths_measured {
             return;
         }
@@ -972,31 +979,38 @@ impl Document {
             self.ensure_disk_cols(maxfields.max(1));
         }
         let snap = self.snap();
-        let mut widths = vec![0usize; self.cols.len()];
+        let mut widths = vec![0f32; self.cols.len()];
         for t in 0..n.min(200) {
             for (c, v) in snap.row_values(snap.row_id(t)).iter().enumerate() {
-                widths[c] = widths[c].max(v.chars().count().min(200));
+                if !v.is_empty() {
+                    widths[c] = widths[c].max(measure(v));
+                }
             }
         }
         for (c, w) in widths.iter().enumerate() {
-            self.widths.insert(self.cols[c], (*w as f32 * char_w + 22.0).clamp(48.0, max_w));
+            self.widths.insert(self.cols[c], (w + 24.0).clamp(48.0, max_w));
         }
         self.widths_measured = true;
     }
 
-    pub fn autofit_col(&mut self, col: usize, char_w: f32, max_w: f32) {
+    /// Fit a column to its content (header + rows around the current scroll position).
+    pub fn autofit_col(&mut self, col: usize, measure: &dyn Fn(&str) -> f32, max_w: f32) {
         let snap = self.snap();
         let id = self.cols[col];
-        let start = self.grid.top;
-        let mut w = 0usize;
+        let mut w: f32 = 0.0;
         for t in 0..self.hdr() {
-            w = w.max(snap.value(snap.row_id(t), id).chars().count());
+            // Header text + room for the sort/filter markers.
+            w = w.max(measure(&snap.value(snap.row_id(t), id)) + 24.0);
         }
-        for vr in start..(start + 300).min(self.vrows()) {
+        let start = self.grid.top.saturating_sub(200);
+        for vr in start..(self.grid.top + 800).min(self.vrows()) {
             let d = self.vrow_to_data(vr);
-            w = w.max(snap.value(self.data_row_id(d), id).chars().count());
+            let v = snap.value(self.data_row_id(d), id);
+            if !v.is_empty() {
+                w = w.max(measure(&v));
+            }
         }
-        self.widths.insert(id, (w as f32 * char_w + 22.0).clamp(36.0, max_w));
+        self.widths.insert(id, (w + 24.0).clamp(36.0, max_w));
     }
 
     // ---------- reading ----------
