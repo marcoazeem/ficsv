@@ -29,6 +29,31 @@ fn is_joiner(c: char) -> bool {
     matches!(c, '\u{200C}' | '\u{200D}')
 }
 
+/// Bidi-mirrored characters: in right-to-left text "(" is drawn as ")" and so on.
+fn mirror(c: char) -> char {
+    match c {
+        '(' => ')',
+        ')' => '(',
+        '[' => ']',
+        ']' => '[',
+        '{' => '}',
+        '}' => '{',
+        '<' => '>',
+        '>' => '<',
+        '«' => '»',
+        '»' => '«',
+        '‹' => '›',
+        '›' => '‹',
+        '≤' => '≥',
+        '≥' => '≤',
+        '⁽' => '⁾',
+        '⁾' => '⁽',
+        '₍' => '₎',
+        '₎' => '₍',
+        c => c,
+    }
+}
+
 /// Fast check used on every visible cell.
 pub fn has_rtl(s: &str) -> bool {
     // Every RTL code point is outside ASCII, so pure-ASCII text skips the scan.
@@ -58,7 +83,16 @@ pub fn visual(s: &str) -> Cow<'_, str> {
     let info = BidiInfo::new(s, None);
     let mut reordered = String::with_capacity(s.len());
     for para in &info.paragraphs {
-        reordered.push_str(&info.reorder_line(para, para.range.clone()));
+        let (levels, runs) = info.visual_runs(para, para.range.clone());
+        for run in runs {
+            let text = &s[run.clone()];
+            if levels[run.start].is_rtl() {
+                // Right-to-left run: reverse it and mirror brackets (Unicode rule L4).
+                reordered.extend(text.chars().rev().map(mirror));
+            } else {
+                reordered.push_str(text);
+            }
+        }
     }
     // The bidi pass fully reversed each RTL run; flip the letters of each run back.
     let chars: Vec<char> = reordered.chars().collect();
@@ -249,6 +283,11 @@ mod tests {
         assert_eq!(visual("מחיר 123"), "123 מחיר");
         // Persian with a zero-width non-joiner stays one run.
         assert_eq!(visual("می\u{200C}خواهم"), "می\u{200C}خواهم");
+        // Brackets inside RTL text are mirrored.
+        assert_eq!(visual("א (ב)"), "(ב) א");
+        assert_eq!(visual("ރޯމް (މެއި 4) -"), "- (4 މެއި) ރޯމް");
+        // Brackets in LTR text are untouched.
+        assert_eq!(visual("Order (طلب)"), "Order (طلب)");
         // Dhivehi (Thaana) is RTL too.
         assert!(has_rtl("ދިވެހި"));
         assert_eq!(visual("ދިވެހި ބަސް"), "ބަސް ދިވެހި");

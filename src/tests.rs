@@ -307,7 +307,7 @@ fn menu_bar_switches_on_hover_when_open() {
     let ctx = egui::Context::default();
     let mut rects: Vec<egui::Rect> = Vec::new();
     let mut ids: Vec<egui::Id> = Vec::new();
-    let mut frame = |t: f64, events: Vec<egui::Event>, rects: &mut Vec<egui::Rect>, ids: &mut Vec<egui::Id>| {
+    let frame = |t: f64, events: Vec<egui::Event>, rects: &mut Vec<egui::Rect>, ids: &mut Vec<egui::Id>| {
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
             time: Some(t),
@@ -341,4 +341,63 @@ fn menu_bar_switches_on_hover_when_open() {
     frame(0.6, vec![egui::Event::PointerMoved(view)], &mut rects, &mut ids);
     frame(0.7, vec![], &mut rects, &mut ids);
     assert!(egui::Popup::is_id_open(&ctx, ids[2]), "hovering View should switch to View");
+}
+
+/// Real-file check: FICSV_SAMPLE=/path/file.csv cargo test sample_file -- --ignored --nocapture
+#[test]
+#[ignore]
+fn sample_file() {
+    let Ok(path) = std::env::var("FICSV_SAMPLE") else { return };
+    let mut d = open(&PathBuf::from(path));
+    println!("rows {} cols {} delimiter {:?} encoding {}", d.nrows(), d.ncols(), d.src.delimiter as char, d.src.encoding.name());
+    let s = crate::settings::Settings::default();
+    let ctx = egui::Context::default();
+    println!("font warning: {:?}", crate::rtl::install_fonts(&ctx, ""));
+    // Characters no installed font can draw (would show as boxes).
+    ctx.begin_pass(egui::RawInput::default());
+    let snap = d.snap();
+    let mut missing = std::collections::BTreeMap::new();
+    for r in 0..d.nrows().min(2000) {
+        for v in snap.row_values(snap.row_id(r + 1)) {
+            for ch in v.chars() {
+                if !ch.is_control() && !ctx.fonts_mut(|f| f.has_glyph(&egui::FontId::proportional(13.0), ch)) {
+                    *missing.entry(ch).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    let _ = ctx.end_pass();
+    println!("chars without a glyph: {:?}", missing.iter().map(|(c, n)| format!("U+{:04X} {c:?} x{n}", *c as u32)).collect::<Vec<_>>());
+    d.widths_measured = false;
+    let mut t = 0.0;
+    let mut frame = |d: &mut Document, ev: Vec<egui::Event>| {
+        t += 0.05;
+        grid_frame(&ctx, d, &s, t, ev);
+    };
+    frame(&mut d, vec![]);
+    frame(&mut d, vec![]);
+    let digits = ((d.nrows().max(1) as f64 + 1.0).log10().floor() as usize) + 1;
+    let rn_w = 16.0 + digits as f32 * (s.font_size * 0.6);
+    for c in 0..d.ncols() {
+        let id = d.cols[c];
+        d.widths.insert(id, 60.0);
+    }
+    for (c, two_in_one_frame) in [(1usize, false), (2, true), (3, false)] {
+        frame(&mut d, vec![]);
+        let left: f32 = (0..c).map(|k| d.width_of(k)).sum();
+        let border = egui::pos2(rn_w + left + d.width_of(c), 10.0);
+        let before = d.width_of(c);
+        frame(&mut d, vec![egui::Event::PointerMoved(border)]);
+        if two_in_one_frame {
+            frame(&mut d, vec![press(border, true), press(border, false), press(border, true), press(border, false)]);
+        } else {
+            frame(&mut d, vec![press(border, true)]);
+            frame(&mut d, vec![press(border, false)]);
+            frame(&mut d, vec![press(border, true)]);
+            frame(&mut d, vec![press(border, false)]);
+        }
+        frame(&mut d, vec![]);
+        println!("double-click col {c} ({}): {before} -> {}", snap.column_name(c), d.width_of(c));
+        assert!(d.width_of(c) > before, "column {c} did not auto-fit");
+    }
 }
