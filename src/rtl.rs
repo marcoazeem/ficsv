@@ -79,6 +79,11 @@ pub fn visual(s: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
+#[cfg(ficsv_bundled_faruma)]
+const BUNDLED_FARUMA: Option<&[u8]> = Some(include_bytes!(env!("FICSV_FARUMA_PATH")));
+#[cfg(not(ficsv_bundled_faruma))]
+const BUNDLED_FARUMA: Option<&[u8]> = None;
+
 /// Locate the Faruma font (the standard Dhivehi/Thaana typeface).
 /// `override_path` (from Preferences) wins when it points at an existing file.
 pub fn find_faruma(override_path: &str) -> Option<PathBuf> {
@@ -128,6 +133,12 @@ pub fn find_faruma(override_path: &str) -> Option<PathBuf> {
     dirs.iter().find_map(|d| scan(d, 0))
 }
 
+/// Faruma font data: Preferences path > installed system font > copy bundled in the app.
+pub fn faruma_bytes(override_path: &str, allow_system: bool) -> Option<Vec<u8>> {
+    let system = if allow_system { find_faruma(override_path) } else { None };
+    system.and_then(|p| std::fs::read(p).ok()).or_else(|| BUNDLED_FARUMA.map(<[u8]>::to_vec))
+}
+
 /// Register fallback fonts: Faruma first (so Thaana/Dhivehi is always drawn with Faruma,
 /// never MV Boli or another Thaana font), then fonts with Arabic, Hebrew and CJK coverage.
 /// Returns a warning when Faruma could not be found.
@@ -168,14 +179,14 @@ pub fn install_fonts(ctx: &egui::Context, faruma_override: &str) -> Option<Strin
             fonts.families.entry(fam).or_default().push(name.clone());
         }
     };
-    let faruma = find_faruma(faruma_override);
-    let warning = match faruma.as_ref().map(|p| (p, std::fs::read(p))) {
-        Some((_, Ok(bytes))) => {
-            // Pushed before any other fallback: egui picks the first font that has a glyph.
+    let faruma_bytes = faruma_bytes(faruma_override, true);
+    let warning = match faruma_bytes {
+        Some(bytes) => {
+            // Pushed before any other fallback: egui picks the first font that has a glyph,
+            // so every Thaana character is drawn with Faruma.
             add(&mut fonts, "faruma".into(), bytes);
             None
         }
-        Some((p, Err(e))) => Some(format!("Could not read Faruma font {}: {e}", p.display())),
         None => Some("Faruma font not found — Dhivehi text needs Faruma (install it or set its path in Preferences)".into()),
     };
     for (i, path) in candidates.iter().enumerate() {
@@ -190,6 +201,21 @@ pub fn install_fonts(ctx: &egui::Context, faruma_override: &str) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_faruma_draws_thaana() {
+        // Simulates a PC without Faruma installed: only the bundled copy is used.
+        let bytes = faruma_bytes("", false).expect("Faruma must be bundled (assets/fonts/Faruma.otf)");
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert("faruma".into(), Arc::new(egui::FontData::from_owned(bytes)));
+        fonts.families.get_mut(&egui::FontFamily::Proportional).unwrap().push("faruma".into());
+        let ctx = egui::Context::default();
+        ctx.set_fonts(fonts);
+        ctx.begin_pass(egui::RawInput::default());
+        let ok = ctx.fonts_mut(|f| "ދިވެހި ބަސް".chars().filter(|c| !c.is_whitespace()).all(|c| f.has_glyph(&egui::FontId::proportional(13.0), c)));
+        let _ = ctx.end_pass();
+        assert!(ok, "every Thaana character must have a Faruma glyph");
+    }
 
     #[test]
     fn ascii_untouched() {

@@ -29,7 +29,7 @@ Its feature set follows [Modern CSV](https://www.moderncsv.com/), including the 
 | Import / export | JSON & XML import (repeating-pattern detection or lossless "preserve structure") and export; **PDF export & print** (page setup, selection only, headers on every page, labels, gridlines, centring, page order, title, page numbers) |
 | Web | Follow hyperlinks, web search, map search, email addresses |
 | UI | Menus for every command, **command launcher** (⌘⇧P / Ctrl+Shift+P) with fuzzy search, context menu, metadata bar, status bar with sum/avg of selection, themes (Light, Dark, Dracula, Solarized Dark/Light), text size, row height, shading, cross-hair highlight, letters or numbers for columns, row/column index base |
-| Languages | **Right-to-left** Arabic, Hebrew, Persian, Urdu and **Dhivehi (Thaana)**: bidi reordering + shaping, RTL cells right-aligned. Dhivehi always uses **Faruma** (auto-detected; set its path in Preferences), never MV Boli. CJK fallback fonts are loaded too |
+| Languages | **Right-to-left** Arabic, Hebrew, Persian, Urdu and **Dhivehi (Thaana)**: bidi reordering + shaping, RTL cells right-aligned. Dhivehi always uses **Faruma**, never MV Boli: a Faruma path set in Preferences is used first, then an installed Faruma, otherwise the copy bundled in the app (`assets/fonts/Faruma.otf`, © The President's Office, Maldives). CJK fallback fonts are loaded too |
 
 ### Filter syntax
 
