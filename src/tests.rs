@@ -267,6 +267,22 @@ fn double_click_border_autofits_rtl_column() {
     let after = d.width_of(0);
     assert!(after > before + 50.0, "double-click should widen the column: before {before}, after {after}");
 
+    // Real double-click: the button stays held for a few frames after the second press.
+    let id = d.cols[0];
+    d.widths.insert(id, 120.0);
+    frame(&mut d, vec![]);
+    let border = egui::pos2(rn_w + 120.0, 10.0);
+    frame(&mut d, vec![egui::Event::PointerMoved(border)]);
+    frame(&mut d, vec![press(border, true)]);
+    frame(&mut d, vec![press(border, false)]);
+    frame(&mut d, vec![press(border, true)]);
+    for _ in 0..5 {
+        frame(&mut d, vec![]); // still holding the button
+    }
+    frame(&mut d, vec![press(border, false)]);
+    frame(&mut d, vec![]);
+    assert!(d.width_of(0) > 400.0, "held double-click should auto-fit, got {}", d.width_of(0));
+
     // Trackpad tap-to-click: both taps can arrive in the same frame.
     let id = d.cols[0];
     d.widths.insert(id, 120.0);
@@ -400,4 +416,37 @@ fn sample_file() {
         println!("double-click col {c} ({}): {before} -> {}", snap.column_name(c), d.width_of(c));
         assert!(d.width_of(c) > before, "column {c} did not auto-fit");
     }
+}
+
+#[test]
+fn double_click_left_edge_of_rtl_column_fits_it() {
+    // An RTL column's text is right-aligned, so its overflow is on the left: double-clicking its
+    // left edge (the previous column's right border) must fit the RTL column too.
+    let long = "ދިވެހިރާއްޖޭގެ ޖުމްހޫރިއްޔާ ".repeat(6);
+    let p = tmp("rtl-left.csv", format!("id,title\n1,{long}\n2,{long}\n").as_bytes());
+    let mut d = open(&p);
+    let s = crate::settings::Settings::default();
+    let ctx = egui::Context::default();
+    crate::rtl::install_fonts(&ctx, "");
+    for c in 0..d.ncols() {
+        let id = d.cols[c];
+        d.widths.insert(id, 100.0);
+    }
+    let mut t = 0.0;
+    let mut frame = |d: &mut Document, ev: Vec<egui::Event>| {
+        t += 0.05;
+        grid_frame(&ctx, d, &s, t, ev);
+    };
+    frame(&mut d, vec![]);
+    let rn_w = 16.0 + 1.0 * (s.font_size * 0.6);
+    let border = egui::pos2(rn_w + 100.0, 10.0); // between "id" and the Dhivehi "title"
+    frame(&mut d, vec![egui::Event::PointerMoved(border)]);
+    frame(&mut d, vec![press(border, true)]);
+    frame(&mut d, vec![press(border, false)]);
+    frame(&mut d, vec![press(border, true)]);
+    frame(&mut d, vec![]);
+    frame(&mut d, vec![press(border, false)]);
+    frame(&mut d, vec![]);
+    assert!(d.width_of(1) > 400.0, "RTL column should auto-fit from its left edge, got {}", d.width_of(1));
+    assert!(d.width_of(0) < 100.0, "the LTR id column fits its short content, got {}", d.width_of(0));
 }

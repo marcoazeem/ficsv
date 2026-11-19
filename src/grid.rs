@@ -18,6 +18,36 @@ const MIN_COL_W: f32 = 24.0;
 pub const MAX_COPY_CELLS: usize = 5_000_000;
 pub const HEADER_ROW: usize = usize::MAX;
 
+/// Debug log for interaction issues: set FICSV_DEBUG=/path/to/log to enable.
+pub fn debug_log(msg: impl FnOnce() -> String) {
+    use std::sync::OnceLock;
+    static PATH: OnceLock<Option<String>> = OnceLock::new();
+    if let Some(p) = PATH.get_or_init(|| std::env::var("FICSV_DEBUG").ok()) {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+            let _ = writeln!(f, "{}", msg());
+        }
+    }
+}
+
+/// Whether a column's text is mostly right-to-left (sampled around the current view).
+fn column_is_rtl(doc: &Document, col: usize) -> bool {
+    let snap = doc.snap();
+    let id = doc.cols[col];
+    let (mut rtl, mut total) = (0, 0);
+    let start = doc.grid.top;
+    for vr in start..(start + 100).min(doc.vrows()) {
+        let v = snap.value(doc.data_row_id(doc.vrow_to_data(vr)), id);
+        if !v.trim().is_empty() {
+            total += 1;
+            if rtl::is_rtl_paragraph(&v) {
+                rtl += 1;
+            }
+        }
+    }
+    total > 0 && rtl * 2 > total
+}
+
 pub fn grid_id() -> Id {
     Id::new("ficsv-grid")
 }
@@ -240,7 +270,9 @@ pub fn show(ui: &mut Ui, doc: &mut Document, s: &Settings, find_re: Option<&Rege
     // Explicit auto-fit (double-click / command) fits the content, up to a generous cap.
     for c in std::mem::take(&mut doc.grid.autofit) {
         if c < doc.ncols() {
+            let before = doc.width_of(c);
             doc.autofit_col(c, &measure, 3000.0);
+            debug_log(|| format!("autofit col {c}: {before} -> {}", doc.width_of(c)));
         }
     }
 
@@ -329,6 +361,26 @@ pub fn show(ui: &mut Ui, doc: &mut Document, s: &Settings, find_re: Option<&Rege
 
     // Double-click on a column border = auto-fit. Every press event in the frame is examined,
     // so two trackpad taps delivered in a single frame still count as a double-click.
+    let any_press = ui.input(|i| i.events.iter().any(|e| matches!(e, Event::PointerButton { pressed: true, .. })));
+    if any_press {
+        let borders: Vec<f32> = (0..ncols_v.min(6)).map(|c| body.left() + prefix[c + 1] - sx).collect();
+        debug_log(|| {
+            format!(
+                "press frame: hovered={} contains={} grid.top={} top_strip={} body.left={} sx={} borders={:?} events={:?}",
+                resp.hovered(),
+                resp.contains_pointer(),
+                grid.top(),
+                top_strip,
+                body.left(),
+                sx,
+                borders,
+                ui.input(|i| i.events.iter().filter(|e| matches!(e, Event::PointerButton { .. })).cloned().collect::<Vec<_>>())
+            )
+        });
+    }
+    // Set when this frame's press completes a border double-click: it must not also start a
+    // resize drag, or the drag (still active while the button is held) would undo the auto-fit.
+    let mut border_double_click = false;
     if resp.hovered() || resp.contains_pointer() {
         let presses: Vec<egui::Pos2> = ui.input(|i| {
             i.events
@@ -345,13 +397,23 @@ pub fn show(ui: &mut Ui, doc: &mut Document, s: &Settings, find_re: Option<&Rege
                 doc.grid.last_border_press = None;
                 continue;
             }
+            debug_log(|| format!("  press at {pp:?}: border={:?} last={:?} now={now}", border_at(pp.x, sx), doc.grid.last_border_press));
             match border_at(pp.x, sx) {
                 Some(c) if doc.grid.last_border_press.is_some_and(|(t, lc)| lc == c && now - t < 0.5) => {
                     let col = doc.vcols[c];
                     if !doc.grid.autofit.contains(&col) {
                         doc.grid.autofit.push(col);
                     }
+                    // RTL text is right-aligned, so an RTL column overflows on its left: the border
+                    // you double-click for it is its left edge. Fit the RTL column on the right too.
+                    if let Some(&next) = doc.vcols.get(c + 1) {
+                        if column_is_rtl(doc, next) && !doc.grid.autofit.contains(&next) {
+                            doc.grid.autofit.push(next);
+                        }
+                    }
                     doc.grid.last_border_press = None;
+                    doc.grid.drag = Drag::None;
+                    border_double_click = true;
                     ui.ctx().request_repaint();
                 }
                 Some(c) => doc.grid.last_border_press = Some((now, c)),
@@ -360,7 +422,7 @@ pub fn show(ui: &mut Ui, doc: &mut Document, s: &Settings, find_re: Option<&Rege
         }
     }
 
-    if pressed && resp.hovered() {
+    if pressed && resp.hovered() && !border_double_click {
         if let Some(p) = pointer {
             if doc.grid.edit.is_some() && commit_edit(doc) {
                 event = Some(GridEvent::Edited);
