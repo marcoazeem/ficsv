@@ -3813,11 +3813,19 @@ impl eframe::App for App {
         }
 
         // Quit confirmation for unsaved files.
-        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_quit {
-            let dirty: Vec<usize> = (0..self.docs.len()).filter(|&i| self.docs[i].dirty).collect();
+        if ctx.input(|i| i.viewport().close_requested()) {
+            let dirty: Vec<usize> =
+                if self.allow_quit { Vec::new() } else { (0..self.docs.len()).filter(|&i| self.docs[i].dirty).collect() };
             if !dirty.is_empty() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.dialog = Some(Dialog::ConfirmClose { tabs: dirty, quit: true });
+            } else if cfg!(target_os = "macos") {
+                // Exit before the NSWindow is torn down. On Touch Bar Macs, AppKit's Touch Bar
+                // observer throws an uncaught NSException (KVO removeObserver) on the run-loop
+                // pass after the winit window closes, which aborts the process and shows a
+                // crash report. Nothing else needs the window teardown, so skip it.
+                self.settings.save();
+                std::process::exit(0);
             }
         }
         // Drag and drop.
