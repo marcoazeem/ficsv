@@ -222,7 +222,7 @@ pub fn visuals(theme: Theme) -> Visuals {
 }
 
 /// Apply theme, typography and spacing.
-pub fn apply_style(ctx: &Context, theme: Theme, font_size: f32) {
+pub fn apply_style(ctx: &Context, theme: Theme, font_size: f32, animations: bool) {
     let v = visuals(theme);
     let egui_theme = if v.dark_mode { egui::Theme::Dark } else { egui::Theme::Light };
     ctx.set_theme(egui_theme);
@@ -248,7 +248,117 @@ pub fn apply_style(ctx: &Context, theme: Theme, font_size: f32) {
         sp.icon_width = 15.0;
         sp.icon_spacing = 6.0;
         s.interaction.tooltip_delay = 0.35;
+        s.animation_time = if animations { motion::BASE } else { 0.0 };
     });
+}
+
+// ---------------------------------------------------------------------------
+// Motion
+// ---------------------------------------------------------------------------
+
+/// Fluid motion helpers. Everything here collapses to "no animation" when the
+/// style's `animation_time` is zero (Preferences → Animations off).
+pub mod motion {
+    use egui::emath::TSTransform;
+    use egui::{vec2, Color32, Context, Id, LayerId, Order, Response};
+
+    /// Hover / press feedback.
+    pub const FAST: f32 = 0.14;
+    /// Dialogs, cards and toasts entering.
+    pub const POP: f32 = 0.28;
+    /// Default for egui's own animations (panels sliding, popups fading, …).
+    pub const BASE: f32 = 0.2;
+    /// Follow speed for `glide` (1/s). Settles in roughly 150 ms.
+    const RATE: f64 = 22.0;
+
+    pub fn enabled(ctx: &Context) -> bool {
+        ctx.global_style().animation_time > 0.0
+    }
+
+    /// Fast start, long soft landing.
+    pub fn ease_out(t: f32) -> f32 {
+        1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(4)
+    }
+
+    /// Eased 0..1 that follows a bool (hover, toggle state).
+    pub fn toggle(ctx: &Context, id: Id, on: bool) -> f32 {
+        if !enabled(ctx) {
+            return if on { 1.0 } else { 0.0 };
+        }
+        ctx.animate_bool_with_time_and_easing(id, on, FAST, egui::emath::easing::cubic_out)
+    }
+
+    /// Linear 0..1 progress since `id` started being shown. Restarts whenever a
+    /// frame goes by without this being called for `id`.
+    pub fn appear(ctx: &Context, id: Id, duration: f32) -> f32 {
+        if !enabled(ctx) {
+            return 1.0;
+        }
+        let now = ctx.input(|i| i.time);
+        let frame = ctx.cumulative_frame_nr();
+        let start = ctx.data_mut(|d| {
+            let e = d.get_temp_mut_or_insert_with(id.with("appear"), || (now, frame));
+            if frame > e.1 + 1 {
+                e.0 = now;
+            }
+            e.1 = frame;
+            e.0
+        });
+        let t = (((now - start) as f32) / duration).clamp(0.0, 1.0);
+        if t < 1.0 {
+            ctx.request_repaint();
+        }
+        t
+    }
+
+    /// Smoothly follow `target` (in points). Interruptible: retargeting mid-flight
+    /// just bends the path. Jumps larger than `snap` are not animated.
+    pub fn glide(ctx: &Context, id: Id, target: f64, snap: f64) -> f64 {
+        if !enabled(ctx) {
+            return target;
+        }
+        let dt = ctx.input(|i| i.stable_dt).min(0.05) as f64;
+        let cur = ctx.data_mut(|d| {
+            let v = d.get_temp_mut_or_insert_with(id, || target);
+            let diff = target - *v;
+            if !v.is_finite() || diff.abs() > snap || diff.abs() < 0.25 {
+                *v = target;
+            } else {
+                *v += diff * (1.0 - (-dt * RATE).exp());
+            }
+            *v
+        });
+        if cur != target {
+            ctx.request_repaint();
+        }
+        cur
+    }
+
+    /// Scale-and-settle entrance for a floating layer (dialog, window).
+    /// Call every frame the layer is shown, after showing it.
+    pub fn pop_in(ctx: &Context, id: Id, resp: &Response) {
+        let t = ease_out(appear(ctx, id, POP));
+        let tf = if t >= 1.0 {
+            TSTransform::IDENTITY
+        } else {
+            let s = 0.96 + 0.04 * t;
+            TSTransform::new(resp.rect.center().to_vec2() * (1.0 - s) + vec2(0.0, (1.0 - t) * 8.0), s)
+        };
+        ctx.set_transform_layer(resp.layer_id, tf);
+    }
+
+    /// Dimmed backdrop behind a modal, fading in with it. Painted above windows
+    /// and below the modal itself, so it stays put while the modal pops in.
+    pub fn backdrop(ctx: &Context, id: Id, alpha: u8) {
+        let t = ease_out(appear(ctx, id.with("backdrop"), FAST));
+        let layer = LayerId::new(Order::Middle, Id::new("modal-backdrop"));
+        ctx.layer_painter(layer).rect_filled(ctx.content_rect(), 0.0, Color32::from_black_alpha((alpha as f32 * t) as u8));
+    }
+}
+
+/// Blend two colours (premultiplied), `t` in 0..1.
+pub fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+    a.lerp_to_gamma(b, t.clamp(0.0, 1.0))
 }
 
 // ---------------------------------------------------------------------------
@@ -260,9 +370,12 @@ pub fn tool_button(ui: &mut Ui, icon: &str, tooltip: &str, enabled: bool) -> Res
     let size = vec2(30.0, 28.0);
     let (rect, resp) = ui.allocate_exact_size(size, if enabled { Sense::click() } else { Sense::hover() });
     let v = ui.visuals();
-    if enabled && (resp.hovered() || resp.is_pointer_button_down_on()) {
-        let fill = if resp.is_pointer_button_down_on() { v.widgets.active.weak_bg_fill } else { v.widgets.hovered.weak_bg_fill };
-        ui.painter().rect_filled(rect, CornerRadius::same(6), fill);
+    let down = enabled && resp.is_pointer_button_down_on();
+    let hover = motion::toggle(ui.ctx(), resp.id.with("hover"), enabled && (resp.hovered() || down));
+    let press = motion::toggle(ui.ctx(), resp.id.with("press"), down);
+    if hover > 0.0 {
+        let fill = mix(v.widgets.hovered.weak_bg_fill, v.widgets.active.weak_bg_fill, press).gamma_multiply(hover);
+        ui.painter().rect_filled(rect.shrink(press), CornerRadius::same(6), fill);
     }
     let color = if enabled { v.text_color() } else { v.weak_text_color().gamma_multiply(0.6) };
     ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, icon, icon_font(17.0), color);
@@ -307,16 +420,14 @@ pub fn chip(ui: &mut Ui, on: &mut bool, icon: &str, tooltip: &str) -> Response {
     }
     let v = ui.visuals();
     let a = v.selection.stroke.color;
-    let (fill, fg) = if *on {
-        (a.gamma_multiply(0.22), a)
-    } else if resp.hovered() {
-        (v.widgets.hovered.weak_bg_fill, v.text_color())
-    } else {
-        (Color32::TRANSPARENT, v.weak_text_color())
-    };
+    let on_t = motion::toggle(ui.ctx(), resp.id.with("on"), *on);
+    let hover = motion::toggle(ui.ctx(), resp.id.with("hover"), resp.hovered());
+    let idle_fill = v.widgets.hovered.weak_bg_fill.gamma_multiply(hover);
+    let fill = mix(idle_fill, a.gamma_multiply(0.22), on_t);
+    let fg = mix(mix(v.weak_text_color(), v.text_color(), hover), a, on_t);
     ui.painter().rect_filled(rect, CornerRadius::same(5), fill);
-    if *on {
-        ui.painter().rect_stroke(rect, CornerRadius::same(5), Stroke::new(1.0, a.gamma_multiply(0.6)), egui::StrokeKind::Inside);
+    if on_t > 0.0 {
+        ui.painter().rect_stroke(rect, CornerRadius::same(5), Stroke::new(1.0, a.gamma_multiply(0.6 * on_t)), egui::StrokeKind::Inside);
     }
     ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, icon, icon_font(15.0), fg);
     resp.on_hover_text(tooltip)
@@ -375,9 +486,11 @@ impl<'a> Dialog<'a> {
         let stroke = ctx.global_style().visuals.window_stroke;
         let shadow = ctx.global_style().visuals.window_shadow;
         let frame = Frame::new().fill(fill).stroke(stroke).shadow(shadow).corner_radius(12).inner_margin(Margin::same(20));
-        let resp = egui::Modal::new(egui::Id::new(self.id))
+        let id = egui::Id::new(self.id);
+        motion::backdrop(ctx, id, 90);
+        let resp = egui::Modal::new(id)
             .frame(frame)
-            .backdrop_color(Color32::from_black_alpha(90))
+            .backdrop_color(Color32::TRANSPARENT)
             .show(ctx, |ui| {
                 ui.set_width(self.width);
                 ui.horizontal(|ui| {
@@ -396,26 +509,34 @@ impl<'a> Dialog<'a> {
                 });
                 r
             });
+        motion::pop_in(ctx, id, &resp.response);
         let dismissed = resp.should_close();
         DialogResult { inner: resp.inner, dismissed }
     }
 }
 
-/// Floating, auto-fading notification in the bottom-right corner.
+/// Floating notification in the bottom-right corner: slides up into place,
+/// then fades and sinks away.
 pub fn toast(ctx: &Context, text: &str, age_secs: f32, kind_warn: bool) {
+    const IN: f32 = 0.3;
     const SHOW: f32 = 4.0;
-    const FADE: f32 = 0.6;
+    const FADE: f32 = 0.45;
     if age_secs > SHOW + FADE {
         return;
     }
-    let alpha = if age_secs < SHOW { 1.0 } else { 1.0 - (age_secs - SHOW) / FADE };
+    let slide = motion::enabled(ctx);
+    let enter = if slide { motion::ease_out(age_secs / IN) } else { 1.0 };
+    let exit = ((age_secs - SHOW) / FADE).clamp(0.0, 1.0);
+    let alpha = enter * (1.0 - exit);
+    let dy = if slide { (1.0 - enter) * 14.0 + exit * exit * 8.0 } else { 0.0 };
     let v = ctx.global_style().visuals.clone();
     let a = v.selection.stroke.color;
     let (icon, color) = if kind_warn { (icon::WARNING, v.warn_fg_color) } else { (icon::INFO, a) };
     egui::Area::new(egui::Id::new("toast"))
-        .anchor(egui::Align2::RIGHT_BOTTOM, vec2(-16.0, -40.0))
+        .anchor(egui::Align2::RIGHT_BOTTOM, vec2(-16.0, -40.0 + dy))
         .order(egui::Order::Foreground)
         .interactable(false)
+        .fade_in(false)
         .show(ctx, |ui| {
             ui.set_opacity(alpha);
             Frame::new()
@@ -432,5 +553,9 @@ pub fn toast(ctx: &Context, text: &str, age_secs: f32, kind_warn: bool) {
                     });
                 });
         });
-    ctx.request_repaint_after(std::time::Duration::from_millis(50));
+    if age_secs < IN || age_secs >= SHOW {
+        ctx.request_repaint();
+    } else {
+        ctx.request_repaint_after(std::time::Duration::from_secs_f32(SHOW - age_secs));
+    }
 }

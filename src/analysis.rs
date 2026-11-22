@@ -1015,7 +1015,7 @@ impl AnalysisWindow {
         self.poll_jobs();
         let mut open = self.open;
         let mut action = None;
-        egui::Window::new("File Analysis")
+        let win = egui::Window::new("File Analysis")
             .id(egui::Id::new("ficsv_file_analysis"))
             .open(&mut open)
             .default_size([820.0, 520.0])
@@ -1024,6 +1024,9 @@ impl AnalysisWindow {
             .show(ctx, |ui| {
                 action = self.ui(ui);
             });
+        if let Some(win) = &win {
+            crate::ui_kit::motion::pop_in(ctx, egui::Id::new("ficsv_file_analysis"), &win.response);
+        }
         if !open {
             self.open = false;
             self.jobs = [None, None, None, None];

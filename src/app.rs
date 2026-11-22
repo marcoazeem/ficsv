@@ -120,7 +120,7 @@ pub struct App {
     allow_quit: bool,
     last_mtime_check: Instant,
     folder_files: Vec<PathBuf>,
-    applied_theme: Option<(Theme, f32)>,
+    applied_theme: Option<(Theme, f32, bool)>,
     logo: Option<egui::TextureHandle>,
     window_title: String,
     update: Update,
@@ -2008,12 +2008,12 @@ impl App {
     // ------------------------------------------------------------------
 
     fn apply_theme(&mut self, ctx: &Context) {
-        let key = (self.settings.theme, self.settings.font_size);
+        let key = (self.settings.theme, self.settings.font_size, self.settings.animations);
         if self.applied_theme == Some(key) {
             return;
         }
         self.applied_theme = Some(key);
-        ui_kit::apply_style(ctx, self.settings.theme, self.settings.font_size);
+        ui_kit::apply_style(ctx, self.settings.theme, self.settings.font_size, self.settings.animations);
     }
 
     fn check_updates(&mut self, ctx: &Context, manual: bool) {
@@ -2081,8 +2081,9 @@ impl App {
         let accent = v.selection.stroke.color;
         let weak = v.weak_text_color();
         let mut action = 0u8; // 1 install, 2 later, 3 restart
+        let enter = ui_kit::motion::ease_out(ui_kit::motion::appear(ctx, egui::Id::new("update-card"), ui_kit::motion::POP));
         egui::Area::new(egui::Id::new("update-card"))
-            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 104.0))
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0 + (1.0 - enter) * 28.0, 104.0))
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 egui::Frame::new()
@@ -2432,6 +2433,11 @@ impl App {
         egui::ScrollArea::horizontal().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
+                // The active-tab plate is painted under the tabs but placed after
+                // layout, so it can glide between them.
+                let plate = ui.painter().add(egui::Shape::Noop);
+                let origin = ui.cursor().left();
+                let mut active_rect = None;
                 for i in 0..self.docs.len() {
                     let d = &self.docs[i];
                     let active = i == self.active;
@@ -2445,14 +2451,13 @@ impl App {
                     let x_resp = ui.interact(x_rect, egui::Id::new(("tab-x", i)), Sense::click());
                     let hovered = resp.hovered() || x_resp.hovered();
                     let p = ui.painter();
-                    let top = CornerRadius { nw: 8, ne: 8, sw: 0, se: 0 };
+                    let hover_t = ui_kit::motion::toggle(ui.ctx(), resp.id.with("hover"), hovered && !active);
                     if active {
-                        p.rect_filled(rect, top, v.extreme_bg_color);
-                        p.hline(rect.left() + 6.0..=rect.right() - 6.0, rect.top() + 1.0, Stroke::new(2.0, accent));
-                    } else if hovered {
-                        p.rect_filled(rect.shrink2(vec2(0.0, 3.0)), CornerRadius::same(6), v.widgets.hovered.weak_bg_fill);
+                        active_rect = Some(rect);
+                    } else if hover_t > 0.0 {
+                        p.rect_filled(rect.shrink2(vec2(0.0, 3.0)), CornerRadius::same(6), v.widgets.hovered.weak_bg_fill.gamma_multiply(hover_t));
                     }
-                    let fg = if active { v.text_color() } else { v.weak_text_color() };
+                    let fg = if active { v.text_color() } else { ui_kit::mix(v.weak_text_color(), v.text_color(), hover_t * 0.6) };
                     let mut x = rect.left() + 12.0;
                     if d.read_only {
                         p.text(pos2(x, rect.center().y), egui::Align2::LEFT_CENTER, ui_kit::icon::LOCK, ui_kit::icon_font(13.0), fg);
@@ -2479,6 +2484,14 @@ impl App {
                     }
                     let tip = d.path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "Not saved yet".into());
                     resp.on_hover_text(tip);
+                }
+                if let Some(r) = active_rect {
+                    let ctx = ui.ctx();
+                    let glide = |key: &str, x: f32| origin + ui_kit::motion::glide(ctx, egui::Id::new(("tab-plate", key)), (x - origin) as f64, 4000.0) as f32;
+                    let r = egui::Rect::from_min_max(pos2(glide("l", r.left()), r.top()), pos2(glide("r", r.right()), r.bottom()));
+                    let top = CornerRadius { nw: 8, ne: 8, sw: 0, se: 0 };
+                    let line = egui::Shape::line_segment([pos2(r.left() + 6.0, r.top() + 1.0), pos2(r.right() - 6.0, r.top() + 1.0)], Stroke::new(2.0, accent));
+                    ui.painter().set(plate, egui::Shape::Vec(vec![egui::Shape::rect_filled(r, top, v.extreme_bg_color), line]));
                 }
                 ui.add_space(4.0);
                 if ui_kit::tool_button(ui, ui_kit::icon::PLUS, "New file", true).clicked() {
@@ -2876,7 +2889,8 @@ impl App {
             .corner_radius(14)
             .inner_margin(egui::Margin::same(10));
         let area = egui::Modal::default_area(egui::Id::new("palette-area")).anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 90.0));
-        let resp = egui::Modal::new(egui::Id::new("palette")).area(area).frame(frame).backdrop_color(Color32::from_black_alpha(70)).show(ctx, |ui| {
+        ui_kit::motion::backdrop(ctx, egui::Id::new("palette"), 70);
+        let resp = egui::Modal::new(egui::Id::new("palette")).area(area).frame(frame).backdrop_color(Color32::TRANSPARENT).show(ctx, |ui| {
             ui.set_width(620.0);
             ui.horizontal(|ui| {
                 ui.add_space(6.0);
@@ -2912,11 +2926,16 @@ impl App {
                     ui.vertical_centered(|ui| ui.weak("No matches"));
                     ui.add_space(12.0);
                 }
+                // Selection highlight glides between rows (placed after layout).
+                let highlight = ui.painter().add(egui::Shape::Noop);
+                let origin = ui.cursor().top();
                 for (k, (_, title, sub, shortcut, item)) in items.iter().enumerate() {
                     let sel = k == p.sel;
                     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 34.0), egui::Sense::click());
                     if sel {
-                        ui.painter().rect_filled(rect, 8, accent.gamma_multiply(0.18));
+                        let y = origin + ui_kit::motion::glide(ui.ctx(), egui::Id::new("palette-sel"), (rect.top() - origin) as f64, 600.0) as f32;
+                        let r = egui::Rect::from_min_size(egui::pos2(rect.left(), y), rect.size());
+                        ui.painter().set(highlight, egui::Shape::rect_filled(r, 8, accent.gamma_multiply(0.18)));
                         resp.scroll_to_me(None);
                     } else if resp.hovered() {
                         ui.painter().rect_filled(rect, 8, v.widgets.hovered.weak_bg_fill);
@@ -2951,6 +2970,7 @@ impl App {
                 ui.label(RichText::new("↑↓ navigate    ↵ run    esc close").size(11.5).color(v.weak_text_color()));
             });
         });
+        ui_kit::motion::pop_in(ctx, egui::Id::new("palette"), &resp.response);
         if resp.should_close() || chosen.is_some() {
             self.palette = None;
         }
@@ -3489,7 +3509,7 @@ impl App {
                 let mut open = true;
                 let mut apply_fonts = false;
                 let s = &mut self.settings;
-                egui::Window::new(RichText::new("Preferences").font(ui_kit::semibold(15.0)))
+                let win = egui::Window::new(RichText::new("Preferences").font(ui_kit::semibold(15.0)))
                     .open(&mut open)
                     .collapsible(false)
                     .resizable(false)
@@ -3533,6 +3553,8 @@ impl App {
                                 ui.end_row();
                                 ui.checkbox(&mut s.show_row_labels, "Row numbers");
                                 ui.checkbox(&mut s.show_col_labels, "Column labels");
+                                ui.end_row();
+                                ui.checkbox(&mut s.animations, "Animations").on_hover_text("Fluid motion: sliding panels, gliding cursor, dialog transitions");
                                 ui.end_row();
                             });
                             egui::Grid::new("prefs-t2").num_columns(2).spacing([16.0, 8.0]).min_col_width(170.0).show(ui, |ui| {
@@ -3617,6 +3639,9 @@ impl App {
                             }
                         });
                     });
+                if let Some(win) = &win {
+                    ui_kit::motion::pop_in(ctx, egui::Id::new("prefs-window"), &win.response);
+                }
                 if apply_fonts {
                     let w = crate::rtl::install_fonts(ctx, &self.settings.dhivehi_font);
                     if let Some(w) = w {
@@ -3815,26 +3840,39 @@ impl eframe::App for App {
         let v = ctx.global_style().visuals.clone();
         let bar = |m: egui::Margin| egui::Frame::new().fill(v.panel_fill).inner_margin(m);
         let line = egui::Stroke::new(1.0, v.widgets.noninteractive.bg_stroke.color);
-        egui::Panel::top("menu").frame(bar(egui::Margin::symmetric(8, 2))).show(ui, |ui| self.menu_bar(ui));
-        if self.settings.show_toolbar {
-            egui::Panel::top("toolbar").frame(bar(egui::Margin::symmetric(8, 3))).show(ui, |ui| self.toolbar(ui));
+        // Toggleable panels slide in and out. The flag is only written back when the
+        // panel itself changed it (dragging the resize edge shut or back open), so
+        // changes made by the panel's own contents are kept.
+        macro_rules! slide {
+            ($panel:expr, $flag:expr, |$pui:ident| $body:expr) => {{
+                let was: bool = $flag;
+                let mut open = was;
+                $panel.show_collapsible(ui, &mut open, |$pui| $body);
+                if open != was {
+                    $flag = open;
+                }
+            }};
         }
+        egui::Panel::top("menu").frame(bar(egui::Margin::symmetric(8, 2))).show(ui, |ui| self.menu_bar(ui));
+        slide!(egui::Panel::top("toolbar").frame(bar(egui::Margin::symmetric(8, 3))), self.settings.show_toolbar, |ui| self.toolbar(ui));
         if !self.docs.is_empty() {
             egui::Panel::top("tabs").frame(bar(egui::Margin { left: 8, right: 8, top: 2, bottom: 0 })).show(ui, |ui| self.tab_bar(ui));
-            if self.settings.show_metadata {
-                egui::Panel::top("meta").frame(bar(egui::Margin::symmetric(12, 6)).stroke(line)).show(ui, |ui| self.metadata_bar(ui));
-            }
-            if self.find_open {
-                egui::Panel::top("find").frame(bar(egui::Margin::symmetric(10, 6)).stroke(line)).show(ui, |ui| self.find_bar(ui));
-            }
+            slide!(egui::Panel::top("meta").frame(bar(egui::Margin::symmetric(12, 6)).stroke(line)), self.settings.show_metadata, |ui| self.metadata_bar(ui));
+            slide!(egui::Panel::top("find").frame(bar(egui::Margin::symmetric(10, 6)).stroke(line)), self.find_open, |ui| self.find_bar(ui));
         }
         egui::Panel::bottom("status").frame(bar(egui::Margin::symmetric(12, 4)).stroke(line)).show(ui, |ui| self.status_bar(ui));
-        if self.settings.show_editor_pane && !self.docs.is_empty() {
-            egui::Panel::bottom("editor").frame(bar(egui::Margin::same(10)).stroke(line)).resizable(true).default_size(140.0).show(ui, |ui| self.editor_pane(ui));
+        if !self.docs.is_empty() {
+            slide!(
+                egui::Panel::bottom("editor").frame(bar(egui::Margin::same(10)).stroke(line)).resizable(true).default_size(140.0),
+                self.settings.show_editor_pane,
+                |ui| self.editor_pane(ui)
+            );
         }
-        if self.settings.show_sidebar {
-            egui::Panel::left("sidebar").frame(bar(egui::Margin::same(10)).stroke(line)).resizable(true).default_size(220.0).show(ui, |ui| self.sidebar(ui));
-        }
+        slide!(
+            egui::Panel::left("sidebar").frame(bar(egui::Margin::same(10)).stroke(line)).resizable(true).default_size(220.0),
+            self.settings.show_sidebar,
+            |ui| self.sidebar(ui)
+        );
 
         let find_re = if self.find_open && self.find.highlight { self.find_regex() } else { None };
         let mut ev = None;

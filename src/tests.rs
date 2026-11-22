@@ -450,3 +450,53 @@ fn double_click_left_edge_of_rtl_column_fits_it() {
     assert!(d.width_of(1) > 400.0, "RTL column should auto-fit from its left edge, got {}", d.width_of(1));
     assert!(d.width_of(0) < 100.0, "the LTR id column fits its short content, got {}", d.width_of(0));
 }
+
+/// Runs `f` once per simulated 60 fps frame.
+#[cfg(test)]
+fn motion_frames(ctx: &egui::Context, t0: f64, n: usize, mut f: impl FnMut(&egui::Context)) -> f64 {
+    let mut time = t0;
+    for _ in 0..n {
+        time += 1.0 / 60.0;
+        let input = egui::RawInput { time: Some(time), predicted_dt: 1.0 / 60.0, ..Default::default() };
+        let _ = ctx.run_ui(input, |ui| f(ui.ctx()));
+    }
+    time
+}
+
+#[test]
+fn motion_glide_follows_then_settles_and_snaps_far_jumps() {
+    use crate::ui_kit::motion;
+    let ctx = egui::Context::default();
+    let id = egui::Id::new("g");
+    let mut v = 0.0;
+    let t = motion_frames(&ctx, 0.0, 3, |c| v = motion::glide(c, id, 0.0, 500.0));
+    assert_eq!(v, 0.0);
+    let t = motion_frames(&ctx, t, 1, |c| v = motion::glide(c, id, 100.0, 500.0));
+    assert!(v > 5.0 && v < 60.0, "first frame should move part of the way, got {v}");
+    let t = motion_frames(&ctx, t, 30, |c| v = motion::glide(c, id, 100.0, 500.0));
+    assert_eq!(v, 100.0, "settles exactly on the target within half a second");
+    motion_frames(&ctx, t, 1, |c| v = motion::glide(c, id, 5000.0, 500.0));
+    assert_eq!(v, 5000.0, "jumps beyond the snap distance are not animated");
+}
+
+#[test]
+fn motion_appear_restarts_after_being_hidden_and_respects_animations_off() {
+    use crate::ui_kit::motion;
+    let ctx = egui::Context::default();
+    let id = egui::Id::new("a");
+    let mut v = 0.0;
+    let t = motion_frames(&ctx, 0.0, 1, |c| v = motion::appear(c, id, 0.25));
+    assert_eq!(v, 0.0);
+    let t = motion_frames(&ctx, t, 30, |c| v = motion::appear(c, id, 0.25));
+    assert_eq!(v, 1.0);
+    let t = motion_frames(&ctx, t, 3, |_| {}); // hidden for a few frames
+    let t = motion_frames(&ctx, t, 1, |c| v = motion::appear(c, id, 0.25));
+    assert_eq!(v, 0.0, "re-showing starts the entrance again");
+    ctx.all_styles_mut(|s| s.animation_time = 0.0);
+    motion_frames(&ctx, t, 1, |c| v = motion::appear(c, id, 0.25));
+    assert_eq!(v, 1.0);
+    let mut g = 0.0;
+    motion_frames(&ctx, t, 1, |c| g = motion::glide(c, egui::Id::new("off"), 1.0, 500.0));
+    motion_frames(&ctx, t, 1, |c| g = motion::glide(c, egui::Id::new("off"), 90.0, 500.0));
+    assert_eq!(g, 90.0);
+}

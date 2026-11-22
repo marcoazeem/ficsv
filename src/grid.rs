@@ -763,11 +763,22 @@ pub fn show(ui: &mut Ui, doc: &mut Document, s: &Settings, find_re: Option<&Rege
     }
 
     // Cursor
-    if cur.0 >= top && cur.0 < row_end && cur.1 < ncols_v {
-        let x = body.left() + prefix[cur.1] - sx;
-        let y = body.top() + (cur.0 - top) as f32 * row_h;
-        let cell = Rect::from_min_size(pos2(x, y), vec2(widths[cur.1], row_h));
-        body_painter.rect_stroke(cell.shrink(1.0), 0.0, cur_stroke, StrokeKind::Inside);
+    // The outline glides to the new cell in content space (so scrolling doesn't
+    // make it lag); jumps of more than a screenful or so just snap.
+    if cur.1 < ncols_v {
+        use crate::ui_kit::motion::glide;
+        let ctx = ui.ctx();
+        let id = grid_id().with("cursor");
+        let snap_y = (vis_rows as f64 + 2.0) * row_h as f64;
+        let snap_x = body.width() as f64 * 1.5;
+        let gx = glide(ctx, id.with("x"), prefix[cur.1] as f64, snap_x) as f32;
+        let gw = glide(ctx, id.with("w"), widths[cur.1] as f64, snap_x) as f32;
+        let gy = glide(ctx, id.with("y"), cur.0 as f64 * row_h as f64, snap_y);
+        let y = body.top() + (gy - top as f64 * row_h as f64) as f32;
+        let cell = Rect::from_min_size(pos2(body.left() + gx - sx, y), vec2(gw, row_h));
+        if cell.intersects(body) {
+            body_painter.rect_stroke(cell.shrink(1.0), 0.0, cur_stroke, StrokeKind::Inside);
+        }
     }
 
     // Column label strip + header row

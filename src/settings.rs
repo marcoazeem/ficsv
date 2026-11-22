@@ -48,6 +48,8 @@ pub struct Settings {
     pub shade_rows: bool,
     pub shade_cols: bool,
     pub highlight_cursor_cross: bool,
+    /// Fluid motion: sliding panels, gliding cursor, dialog and toast transitions.
+    pub animations: bool,
     pub show_row_labels: bool,
     pub show_col_labels: bool,
     pub col_letters: bool,
@@ -85,6 +87,7 @@ impl Default for Settings {
             shade_rows: true,
             shade_cols: false,
             highlight_cursor_cross: false,
+            animations: true,
             show_row_labels: true,
             show_col_labels: true,
             col_letters: true,
